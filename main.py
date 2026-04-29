@@ -209,35 +209,20 @@ if __name__ == "__main__":
             for cases in test_cases_list
             for test_case in cases['csv']
         ]
+        
+        max_worker = conf_reader.get("agents.http_agent.call_agent_th_max")
+
         # 调用agent获取响应
-        run_in_thread_pool(partial(call_agent, agent), all_cases, task_name="call_agent")
+        run_in_thread_pool(partial(call_agent, agent), all_cases, max_workers=max_worker, task_name="call_agent")
         # 组装llm_test_case
-        run_in_thread_pool(make_llm_case, all_cases, task_name='make_llm_test_case')
+        run_in_thread_pool(make_llm_case, all_cases, max_workers=max_worker, task_name='make_llm_test_case')
         for test_case in test_cases_list:
             run_evaluate(test_case)
     else:
         # TODO: 非API调用的agent接入注册位置
         pass
 
-
-    csv_wirter = CsvWriter('test/test_output.csv')
+    result_save_path = conf_reader.get("result.save_path")
+    csv_wirter = CsvWriter(result_save_path)
     for test_case in test_cases_list:
         csv_wirter.write_rows(test_case['csv'])
-
-
-    # print(csv_path)
-
-
-    # if os.path.isdir(csv_path):
-    #     # 如果是目录，则执行目录下所有csv文件
-    #     for file in os.listdir(csv_path):
-    #         if file.endswith('.csv'):
-    #             pass
-    #             # test_cases = csv_reader.CsvReader(os.path.join(csv_path, file)).read_rows()
-    # elif os.path.isfile(csv_path) and csv_path.endswith('.csv'):
-    #     # 如果是单个csv文件，则执行该文件
-    #     print(f"正在执行测试数据集: {csv_path}")
-    #     test_cases = csv_reader.CsvReader(csv_path).read_rows()
-    # else:
-    #     raise ValueError("请提供有效的CSV文件路径或包含CSV文件的目录路径。")
-    
