@@ -14,33 +14,34 @@ class CollectionResult:
         csv_header = self.csv_reader.get_headers()
         for key in csv_header:
             if "_is_success" in key:
-                key.removesuffix('_is_success')
-                metrics_name_list.append(key)
+                metrics_name_list.append(key.removesuffix('_is_success'))
         return metrics_name_list           
 
-    def task_success_stats(self):
+    def task_success_stats(self)->dict:
         """
         统计task通过率，包含总任务通过率以及各个metrics的通过率,返回总的任务成功率以及各metrics的成功率
+
+        :returns: 分组计算的任务成功率，{'total':, 'metricxxx':,....}
         """
 
         task_success_count = {'total':0}
         metrics = self.get_metrics()
-        for metirc in metrics:
-            task_success_count[metirc] = 0
+        for metric in metrics:
+            task_success_count[metric] = 0
 
         results_list = self.csv_reader.read_rows()
         total_task_count = len(results_list) 
 
         for result in results_list:
-            if result['is_success'] == "TRUE":
+            if result['is_success'] == "True":
                 task_success_count['total'] += 1
             for metric in metrics:
-                if result[f'{metric}_is_success'] == "TRUE":
-                    task_success_count[metirc] += 1
+                if result[f'{metric}_is_success'] == "True":
+                    task_success_count[metric] += 1
 
-        total_task_success_rate = 
+        task_success_rate = {
+            key: round(count / total_task_count, 4)*100
+            for key, count in task_success_count.items()
+        }
 
-
-        
-        
-    
+        return task_success_rate

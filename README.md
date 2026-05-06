@@ -6,18 +6,21 @@
 
 ```text
 .
-├── agents/												 # agent注册目录
+├── agents/                        # agent注册目录
 │   └── http_agent.py              # HTTP 方式调用待测 Agent
-├── evaluator/										 # LLM-as-Judger注册目录，在此处注册其余ai供应商
+├── evaluator/                     # LLM-as-Judger注册目录，在此处注册其余ai供应商
 │   ├── claud_judge_llm.py         # Claude Judge 模型封装
 │   ├── deepeval_patch.py          # 对 deepeval / anthropic 的兼容性 patch，规避think block text error
 │   └── metrics.py                 # 自定义评测指标注册与构造，单例返回
 ├── result/
 │   └── .gitkeep                   # 预留结果目录
-├── test_suite/										 # 默认测试数据集存放目录
+├── test_suite/                    # 默认测试数据集存放目录
 │   ├── test_cases_*.csv           # 多类测试集
 │   └── test_cases_*.json          # 对应 JSON 数据
 ├── tool/
+│   ├── __init__.py                # 工具模块导出
+│   ├── async_result_writer.py     # 异步结果写入器，使用独立线程处理结果写入
+│   ├── collection_result.py       # 结果统计分析工具
 │   ├── config_reader.py           # 配置读取工具，单例调用
 │   ├── csv_reader.py              # CSV 读取工具
 │   └── csv_writer.py              # CSV 写入工具

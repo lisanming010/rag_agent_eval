@@ -8,10 +8,9 @@ import argparse
 import os
 
 from agents.http_agent import HTTPAgent
-from tool.csv_reader import CsvReader
-from tool.config_reader import ConfigReader
-from tool.csv_writer import CsvWriter
+from tool import AsyncResultWriter, CsvReader, CsvWriter, ConfigReader
 from evaluator.metrics import reverse_validation_metric, contextual_recall_metric
+from tool.collection_result import CollectionResult
 
 
 TEST_SUITE_MAP = {}
@@ -60,6 +59,7 @@ def make_test_case_list(csv_path, metrics:list|None)->list[dict]:
     :metrics: 传递的metrics
     """
 
+    print('读取测试用例集中......')
     test_case_list = []
     # 测试数据集转换
     if csv_path is not None:
@@ -228,22 +228,28 @@ if __name__ == "__main__":
         run_in_thread_pool(partial(call_agent, agent), all_cases, max_workers=max_worker, task_name="call_agent")
         # 组装llm_test_case
         run_in_thread_pool(make_llm_case, all_cases, max_workers=max_worker, task_name='make_llm_test_case')
+        
+        # 执行断言并回写测试结果
+        result_csv_path_list = []
+        result_save_path = conf_reader.get("result.save_path")
+        base_path = mkdir_with_timestamp(result_save_path)
+        # 异步写入
+        writer = AsyncResultWriter(base_path)
+        writer.start()
+
         for test_case in test_cases_list:
             run_evaluate(test_case)
+            writer.submit(test_case, test_case['case_name'])
+        writer.wait_and_stop()
+        print(writer.get_stats())
+
+        # 汇总测试结果
+        for file in os.listdir(base_path):
+            if file.endswith('.csv') and 'result_outputs_' in file:
+                result_csv_path = os.path.join(base_path, file)
+                collection_result = CollectionResult(result_csv_path)
+                print(f'{result_csv_path}: {collection_result.task_success_stats()}')
+                        
     else:
         # TODO: 非HTTP调用的agent接入注册位置
         pass
-
-    result_csv_path_list = []
-    result_save_path = conf_reader.get("result.save_path")
-    base_path = mkdir_with_timestamp(result_save_path)
-    mkdir_with_timestamp()
-    for test_case in test_cases_list:
-        csv_file_name = os.path.basename(test_case['name'])
-        result_output = csv_file_name.replace('test_case', 'result_output')
-        result_csv_path = os.path.join(base_path, result_output)
-        csv_wirter = CsvWriter(result_csv_path)
-        csv_wirter.write_rows(test_case['csv'])
-        result_csv_path_list.append(result_csv_path)
-    
-    print(result_csv_path_list)

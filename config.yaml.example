@@ -1,0 +1,64 @@
+# agent配置
+agents:
+  # 使用何种形式接入agent
+  type: http 
+  http_agent:
+    endpoint: http://xxxxx
+    mode: FAST
+    # 最高调用并发
+    call_agent_th_max: 8
+
+# 评价模型配置
+judge_llm:
+  anthropic:
+    model: claude-opus-4-7
+    temperature: 0
+    max_token: 4096
+
+# 不同的metrics通过阈值设置
+judge_thresholds:
+  contextual_recall: 0.7
+
+# 评价器配置
+evluate:
+  # 是否启用异步并发
+  run_async: True
+  # 最大并发数量
+  max_concurrent: 10
+  # 提交间隔s
+  throttle_value: 0
+
+dataset:
+  # 测试用例集存放路径，可以指定文件夹也可以指定具体某个测试用例集csv文件
+  # 当指定的是具体的csv文件时需要手动指定需要调用的metrics名称
+  # 当指定的是文件夹时将会自动寻找寻找test_cases_xxx.csv文件，匹配规则：test_cases开头的csv文件
+  default_dataset_path: test/
+  
+  # 如果指定了测试用例集路径则需要在此指定用例集的metric
+  metrics_if_specify_csv:
+    - reverse_validation
+    - contextual_recall
+
+  # 如果指定的是用例集路径，则需要在此处指定默认用例集与希望调用的metrics映射关系
+  dataset_metrics_map:
+    base:
+      - reverse_validation
+      - contextual_recall
+    hallucination:
+      - reverse_validation
+      - contextual_recall
+    inference:
+      - reverse_validation
+      - contextual_recall
+    retrieval:
+      - reverse_validation
+      - contextual_recall
+    robustness:
+      - reverse_validation
+      - contextual_recall
+    multiturn:
+      - reverse_validation
+      - contextual_recall
+
+result:
+  save_path: result/
