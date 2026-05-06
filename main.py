@@ -3,6 +3,7 @@ from deepeval.evaluate.configs import AsyncConfig
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from deepeval.test_case import LLMTestCase
 from functools import partial
+from datetime import datetime
 import argparse
 import os
 
@@ -81,7 +82,7 @@ def make_test_case_list(csv_path, metrics:list|None)->list[dict]:
                     if file.endswith('.csv'):
                         data_set_type = file.removesuffix('.csv').split('_')[-1]
                         if 'test_cases_' not in file:
-                            print(file)
+                            print(f'{file}未被匹配')
                             continue
                         metrics = conf_reader.get(f'dataset.dataset_metrics_map.{data_set_type}', None)
                         if metrics is None:
@@ -152,7 +153,7 @@ def run_evaluate(test_case:dict):
     :params: test_case:测试数据集,即测试用例list中的整个成员，test_case_list[0]
     """
 
-    conf_reader = ConfigReader().get_instance()
+    conf_reader = ConfigReader.get_instance()
 
     
     test_case_csv = test_case['csv']
@@ -190,6 +191,17 @@ def run_evaluate(test_case:dict):
             case_dict[f'{metrics_name}_reason'] = md.reason
 
 
+def mkdir_with_timestamp(base_path):
+    """
+    创建当前时间戳命名的文件夹,父目录不存在的情况下也会直接创建出父目录,返回父目录+时间戳目录
+
+    :params: base_path:父目录
+    """
+    timestamp = datetime.now().strftime('%m%d%H%M%S')
+    output_dir = os.path.join(base_path, timestamp)
+    os.makedirs(output_dir, exist_ok=True)
+    return output_dir
+
 if __name__ == "__main__":
     conf_reader = ConfigReader.get_instance()
     params = parse_args()
@@ -219,10 +231,19 @@ if __name__ == "__main__":
         for test_case in test_cases_list:
             run_evaluate(test_case)
     else:
-        # TODO: 非API调用的agent接入注册位置
+        # TODO: 非HTTP调用的agent接入注册位置
         pass
 
+    result_csv_path_list = []
     result_save_path = conf_reader.get("result.save_path")
-    csv_wirter = CsvWriter(result_save_path)
+    base_path = mkdir_with_timestamp(result_save_path)
+    mkdir_with_timestamp()
     for test_case in test_cases_list:
+        csv_file_name = os.path.basename(test_case['name'])
+        result_output = csv_file_name.replace('test_case', 'result_output')
+        result_csv_path = os.path.join(base_path, result_output)
+        csv_wirter = CsvWriter(result_csv_path)
         csv_wirter.write_rows(test_case['csv'])
+        result_csv_path_list.append(result_csv_path)
+    
+    print(result_csv_path_list)

@@ -217,6 +217,8 @@ dataset:
 
 ## 测试集格式
 
+测试集命名规则：test_case_xxx.csv，必须使用**“test_case”**开头且是**csv格式文件**。
+
 测试集 CSV 目前至少包含以下字段，示例可见 [test_suite/test_cases_base.csv](test_suite/test_cases_base.csv)：
 
 - `id`
@@ -254,5 +256,7 @@ dataset:
 
 ## TODO
 
-- [ ] 测试结果汇总统计生成报告
+- [ ] 测试结果汇总统计生成报告，部分评估指标落地
 - [ ] metircs类型完善
+- [ ] 文档召回相关（当前好像没办法指定agent输出哪些额外的内容）
+- [ ] 多轮对话相关
