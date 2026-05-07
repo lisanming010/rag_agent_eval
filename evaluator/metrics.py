@@ -82,11 +82,13 @@ class CreateMetrics:
         return metric
     
 
+conf_reader = ConfigReader.get_instance()
 # metric创建，单例
 createmetrics = CreateMetrics()
 
 # 自定义反向验证指标，测试数据集中的negative_criteria字段
 # 可以作为幻觉评测
+reverse_validation_thresholds = conf_reader.get('judge_thresholds.reverse_validation', 0.7)
 reverse_validation_metric = createmetrics.create_metric_base_geval(
     name="reverse_validation_metric",
     criteria="retrieval_context中不应该包含context中的关键信息",
@@ -99,14 +101,14 @@ reverse_validation_metric = createmetrics.create_metric_base_geval(
         "执行比较，如果retrieval_context中体现了任一不该体现的信息则判定违禁，打分0分",
         "如果retrieval_context中也明确禁止了context中禁止的的操作例如：context中有：’不应该xxx’，在retrieval_context中也有’禁止xxx’或类似表述则不视为违禁，打分100分",
         "如果retrieval_context中没有体现禁止项则视为未违禁，比如：context中有：’不应该A’，retrieval_context中做了B、C则也同样视为不违禁，打分100分"
-    ]
+    ],
+    threshold=reverse_validation_thresholds
 )
 
 # 鲁棒性评测指标
 
 
 # ContextualRecallMetric metics 
-conf_reader = ConfigReader.get_instance()
 contextual_recall_threshold = conf_reader.get('judge_thresholds.contextual_recall', 0.7)
 contextual_recall_metric = createmetrics.create_contextual_recall_metric(threshold=contextual_recall_threshold)
 

@@ -11,6 +11,7 @@ dotenv = "*"
 pyyaml = "*"
 anthropic = "*"
 json-repair = "*"
+numpy = "*"
 
 [dev-packages]
 

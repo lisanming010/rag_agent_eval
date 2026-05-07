@@ -105,8 +105,9 @@ def make_test_case_list(csv_path, metrics:list|None)->list[dict]:
 def call_agent(agent:HTTPAgent, test_case_csv:dict):
     """agent调用入口，将agent响应并入原有字典中"""
 
-    _, answer_summary = agent.call_agent(test_case_csv['question'])
+    _, answer_summary, res_time = agent.call_agent(test_case_csv['question'])
     test_case_csv['agent_response'] = answer_summary
+    test_case_csv['res_time(s)'] = res_time
 
 def run_in_thread_pool(fn, items:list, max_workers:int=8, task_name:str="task"):
     """
@@ -248,7 +249,19 @@ if __name__ == "__main__":
             if file.endswith('.csv') and 'result_outputs_' in file:
                 result_csv_path = os.path.join(base_path, file)
                 collection_result = CollectionResult(result_csv_path)
-                print(f'{result_csv_path}: {collection_result.task_success_stats()}')
+
+                # 任务执行结果汇总统计
+                task_success_stat = collection_result.task_success_stats()
+                print("\n========任务执行结果统计==========")
+                for k, v in task_success_stat:
+                    print(f'{k}: {v}')
+                
+                # 响应时间结果汇总统计
+                res_time = collection_result.res_time()
+                print("\n========响应时间统计==========")
+                for k, v in res_time:
+                    print(f'{k}: {v}')
+
                         
     else:
         # TODO: 非HTTP调用的agent接入注册位置

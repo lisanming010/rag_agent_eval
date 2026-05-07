@@ -1,4 +1,5 @@
 import os
+import numpy as np
 
 from tool.csv_reader import CsvReader
 
@@ -45,3 +46,22 @@ class CollectionResult:
         }
 
         return task_success_rate
+
+    def res_time(self):
+        """
+        call agent响应时间结果汇总
+        """
+        res_time_list = []
+        res_time_result_dict = {}
+
+        result_list = self.csv_reader.read_rows()
+        for result in result_list:
+            res_time_list.append(result['res_time(s)'])
+
+        res_time_result_dict['任务最长耗时'] = max(res_time_list)
+        res_time_result_dict['任务耗时平均值'] = np.mean(res_time_list)
+        res_time_result_dict['任务耗时p99'] = np.percentile(res_time_list, 99)
+        res_time_result_dict['任务耗时p95'] = np.percentile(res_time_list, 95)
+
+        return res_time_result_dict
+        

@@ -328,5 +328,5 @@ result_output_hallucination.csv: {'total': 76.2, 'reverse_validation': 88.1, 'co
 
 ## TODO
 
-- [ ] 支持更多评测指标(多轮对话、工具调用等)
+- [ ] 支持更多评测指标
 - [ ] 生成 HTML/Markdown 格式的详细报告
