@@ -24,6 +24,7 @@
 │   ├── async_result_writer.py     # 异步结果写入器
 │   ├── collection_result.py       # 结果统计分析工具
 │   ├── config_reader.py           # 配置读取工具(单例)
+│   ├── markdown_writer.py         # 结果md输出工具
 │   ├── csv_reader.py              # CSV 读取工具
 │   └── csv_writer.py              # CSV 写入工具
 ├── .env.example                   # 环境变量示例
@@ -298,7 +299,8 @@ result/
   └── 0507123045/
       ├── result_output_base.csv
       ├── result_output_hallucination.csv
-      └── result_output_robustness.csv
+      ├── result_output_robustness.csv
+      └── test_report.md                  # 测试结果汇总，当前有各指标完成率和任务执行时间相关统计
 ```
 
 ### 结果字段
@@ -314,19 +316,7 @@ result/
   - `{metric}_threshold`: 该指标阈值
   - `{metric}_reason`: 该指标评判理由
 
-### 统计输出
-
-程序执行完成后会输出统计信息:
-
-```
-=== 评测结果统计 ===
-result_output_base.csv: {'total': 85.5, 'reverse_validation': 92.3, 'contextual_recall': 78.6}
-result_output_hallucination.csv: {'total': 76.2, 'reverse_validation': 88.1, 'contextual_recall': 64.3}
-
-写入统计: 成功 2, 失败 0
-```
-
 ## TODO
 
-- [ ] 支持更多评测指标
-- [ ] 生成 HTML/Markdown 格式的详细报告
+- [ ] 召回结果验证包括关联的MRR、Recall@K、Precision@K指标，需要能够拿到相关召回文档列表
+- [x] 生成 HTML/Markdown 格式的详细报告
