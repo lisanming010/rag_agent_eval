@@ -2,7 +2,7 @@
 # from pathlib import Path
 # sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from deepeval.metrics import ContextualRecallMetric, GEval 
+from deepeval.metrics import ContextualRecallMetric, GEval, BaseMetric
 from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 
 from tool.config_reader import ConfigReader
@@ -23,7 +23,7 @@ TESTCASE_PARAMS_MAP = {
 }
 
 class CreateMetrics:
-    """评测指标类，负责创建和管理评测指标实例"""
+    """评测指标类，负责创建和管理内置的或基于GEval的自定义评测指标实例"""
     def __init__(self):
         self.model = ClaudJudgeLLM().get_model()
 
@@ -80,7 +80,131 @@ class CreateMetrics:
         )
 
         return metric
+
+class MRRMetric(BaseMetric):
+    """自定义MRR指标评判类，非LLM"""
+
+    def __init__(self, threshold: float=0.7, topk: int=0):
+        self.threshold = threshold
+        self.topk = topk
+
+    def measure(self, test_case: LLMTestCase)->float:
+        """
+        计算MRR并评分
+
+        可能预期内有多个文档均期望被召回，仅看期望召回文档列表中排名最靠前的结果
+        如：expected = [a, b, c]，实际召回：[x, z, b, c, y]，那最终MRR以b的结果为准
+
+        retrieval_context: 实际返回的候选列表（按相关性排序）
+        expected_output: 期望命中的文档/答案
+        """
+        retrieved = test_case.retrieval_context or []
+        # topk截断
+        if self.topk > 0:
+            retrieved = retrieved[:self.topk]
+
+        # 避免切分出空值
+        expected = [item.strip() for item in (test_case.expected_output or '').split('|') if item.strip()]
+
+        self.score = 0.0
+        first_recall_doc = ''
+        for ex in expected:
+            ex = ex.strip()
+            for rank, item in enumerate(retrieved, start=1):
+                if item in ex:
+                    curr_score = 1 / rank
+                    if curr_score > self.score:
+                        self.score = curr_score
+                        first_recall_doc = ex
+                        break
+
+        self.success = self.score >= self.threshold
+        if self.score > 0:
+            self.reason = f'第一个命中的文档是：{first_recall_doc}, 命中位置在：{int(1/self.score)}'
+        else:
+            self.reason = '未命中任何期望文档'
+        return self.score
     
+    async def a_measure(self, test_case: LLMTestCase)->float:
+        return self.measure(test_case)
+    
+    def is_successful(self):
+        return self.success
+    
+    @property
+    def __name__(self):
+        return "MRR"
+
+
+class RetrievalKMetricBase(BaseMetric):
+    def __init__(self, threshold: float = 0.7, topk: int = 0):
+        self.threshold = threshold
+        self.topk = topk
+
+    def _prepare(self, test_case: LLMTestCase) -> tuple[list[str], list[str]]:
+        retrieved = test_case.retrieval_context or []
+        if self.topk > 0:
+            retrieved = retrieved[:self.topk]
+
+        expected = [item.strip() for item in (test_case.expected_output or '').split('|') if item.strip()]
+        return retrieved, expected
+
+    def _count_hits(self, retrieved: list[str], expected: list[str]) -> tuple[int, list[str]]:
+        hit_count = 0
+        hit_items = []
+        for ex in expected:
+            for item in retrieved:
+                if ex in item:
+                    hit_count += 1
+                    hit_items.append(ex)
+                    break
+        return hit_count, hit_items
+
+    async def a_measure(self, test_case: LLMTestCase) -> float:
+        return self.measure(test_case)
+
+    def is_successful(self):
+        return self.success
+
+
+class RecallK(RetrievalKMetricBase):
+    """自定义Recall@K评测指标，召回覆盖率，非LLM"""
+
+    def measure(self, test_case: LLMTestCase) -> float:
+        retrieved, expected = self._prepare(test_case)
+        hit_count, hit_items = self._count_hits(retrieved, expected)
+
+        self.score = hit_count / len(expected) if expected else 0.0
+        self.success = self.score >= self.threshold
+        if hit_items:
+            self.reason = f'命中的期望项：{" | ".join(hit_items)}，Recall@K={self.score:.4f}'
+        else:
+            self.reason = '未命中任何期望项'
+        return self.score
+
+    @property
+    def __name__(self):
+        return "RecallK"
+
+
+class PrecisionK(RetrievalKMetricBase):
+    """自定义Precision@K评测指标，召回准确率，非LLM"""
+
+    def measure(self, test_case: LLMTestCase) -> float:
+        retrieved, expected = self._prepare(test_case)
+        hit_count, hit_items = self._count_hits(retrieved, expected)
+
+        self.score = hit_count / len(retrieved) if retrieved else 0.0
+        self.success = self.score >= self.threshold
+        if hit_items:
+            self.reason = f'命中的期望项：{" | ".join(hit_items)}，Precision@K={self.score:.4f}'
+        else:
+            self.reason = '前K个结果中未命中任何期望项'
+        return self.score
+
+    @property
+    def __name__(self):
+        return "PrecisionK"
 
 conf_reader = ConfigReader.get_instance()
 # metric创建，单例
@@ -88,7 +212,7 @@ createmetrics = CreateMetrics()
 
 # 自定义反向验证指标，测试数据集中的negative_criteria字段
 # 可以作为幻觉评测
-reverse_validation_thresholds = conf_reader.get('judge_thresholds.reverse_validation', 0.7)
+reverse_validation_thresholds = conf_reader.get('metric_conf.reverse_validation.threshold', 0.7)
 reverse_validation_metric = createmetrics.create_metric_base_geval(
     name="reverse_validation_metric",
     criteria="retrieval_context中不应该包含context中的关键信息",
@@ -105,60 +229,21 @@ reverse_validation_metric = createmetrics.create_metric_base_geval(
     threshold=reverse_validation_thresholds
 )
 
-# 鲁棒性评测指标
-
-
 # ContextualRecallMetric metics 
-contextual_recall_threshold = conf_reader.get('judge_thresholds.contextual_recall', 0.7)
+contextual_recall_threshold = conf_reader.get('metric_conf.contextual_recall.threshold', 0.7)
 contextual_recall_metric = createmetrics.create_contextual_recall_metric(threshold=contextual_recall_threshold)
 
+# MRRmteric
+mrr_threshold = conf_reader.get('metric_conf.mrr.threshold', 0.7)
+mrr_topk = conf_reader.get('metric_conf.mrr.topk', 0)
+mrr_metric = MRRMetric(threshold=mrr_threshold, topk=mrr_topk)
 
-if __name__ == "__main__":
+# recall@K
+recall_k_threshold = conf_reader.get('metric_conf.recall_k.threshold', 0.8)
+recall_k_topk = conf_reader.get('metric_conf.recall_k.topk', 5)
+recallk_metric = RecallK(threshold=recall_k_threshold, topk=recall_k_topk)
 
-    from deepeval import evaluate
-
-    test_case = LLMTestCase(
-        input="写 SQL 查询 2026-03 的数据，时间条件如何写更符合规则？",
-        context=["使用 LIKE 过滤日期 | 对时间字段做函数包装后过滤"],
-        retrieval_context=["### SQL 时间条件书写规则\n\n根据 DSP SQL 规则，在为 `2026-03` 这样的月份编写时间条件时，应遵循以下原则以确保查询正确性和性能：\n\n**核心原则**：优先对原始时间字段进行范围过滤，避免使用函数包装或 `LIKE`。\n\n#### **推荐写法**\n- **使用 `BETWEEN`**：当过滤整个月份时，这是最直观的写法。\n  ```sql\n  report_date BETWEEN '2026-03-01' AND '2026-03-31'\n  ```\n- **使用范围比较**：对于包含时分秒的字段，使用 `[起始, 结束)` 的左闭右开区间更精确。\n  ```sql\n  create_time >= '2026-03-01 00:00:00' AND create_time < '2026-04-01 00:00:00'\n  ```\n\n#### **应避免的写法**\n- **不要使用 `LIKE`**：这会导致性能问题且不精确。\n  - `report_date LIKE '2026-03%'`\n- **不要在过滤列上使用函数**：这会使索引失效。\n  - `DATE(create_time) >= '2026-03-01' AND DATE(create_time) <= '2026-03-31'`\n  - `SUBSTR(report_hour, 1, 7) = '2026-03'`\n\n**补充说明**：\n- 如果表有时间分区字段，应优先使用该字段进行过滤。\n- 所有时间均按 UTC+0 存储，只有在用户明确提供时区时才进行 `DATE_ADD` 换算。"]
-    )
-
-    test_case2 = LLMTestCase(
-        input="用户说要查 Google 渠道的域名表现，能直接把 affiliate 当成 domain 吗？",
-        context=["直接把渠道名等同于域名 | 混淆 first_ssp 与 affiliate"],
-        retrieval_context=["### 简报：`affiliate`与`domain`字段在数据分析中的区别\n\n根据 `pac_dsp_response` 表结构文档，**不可以**将 `affiliate` 字段直接等同于 `domain` 字段来分析渠道表现。这两个字段代表了广告流量在不同层级的归属。\n\n#### 核心结论\n- **`affiliate` 代表渠道**: `affiliate_name` 字段指代的是广告流量交易所，即流量的来源**平台或渠道**，例如 'Google'、'OPPO_TecdoDSP'、'vivo'。\n- **`domain` 代表媒体**: `domain` 字段指代的是流量来源的**具体媒体**，即广告实际展示的网站域名。对于App内流量，对应的字段是 `bundle_id`（应用包名）。\n\n#### 字段定义解析\n\n| 字段名 | 描述 | 作用 |\n| :--- | :--- | :--- |\n| **`affiliate_name`** | 广告流量交易所的名称 | 用于区分大的流量渠道，如 Google、Vivo 等。 |\n| **`domain`** | 当前流量来源媒体（bundle）的域名 | 用于识别Web流量下，广告展示的具体网站。 |\n| **`bundle_id`** | 流量来源媒体的唯一标识符 | 用于识别App流量下，广告展示的具体应用。 |\n| **`traffic_type`** | 流量的来源类型 | 关键区分字段：`1` 代表App内流量，`2` 代表Web流量。 |\n\n#### 正确的分析方法\n要查询 Google 渠道下不同域名的表现，应遵循以下步骤：\n1.  **筛选渠道**: 使用 `WHERE affiliate_name LIKE '%Google%'`（或具体Google渠道的准确名称）来圈定 Google 渠道的流量。\n2.  **区分流量类型**:\n    *   对于 **Web 流量**（`traffic_type = 2`），使用 `domain` 字段进行分组（`GROUP BY domain`），以分析各个网站域名的表现。\n    *   对于 **App 流量**（`traffic_type = 1`），应使用 `bundle_id` 字段进行分组，以分析各个应用的表现。\n\n因此，`affiliate` 是分析的起点（渠道），而 `domain` 或 `bundle_id` 则是更深层次的分析维度（媒体）。"]
-    )
-
-    test_case3 = LLMTestCase(
-        input="DSP 的广告投放五层级是什么？",
-        context=["层级顺序错误 | 遗漏任一层级"],
-        retrieval_context=["### DSP 广告投放五层级结构\n\n根据提供的业务背景资料，DSP 的广告投放采用自上而下的五层级结构：\n\n1.  **广告主 (adv)**：最高层级，代表广告客户。\n2.  **活动 (campaign)**：用于设定推广目标、日预算和目标平台（如 app/web）。\n3.  **广告组 (ad_group)**：负责具体的出价策略、定向条件、预算控制和优化目标。\n4.  **广告 (ad)**：创意的投放单元，关联具体的素材。\n5.  **素材 (creative)**：广告展示的最终内容，如图片、视频、图标等，存储于素材库。"]
-    )
-
-    test_case4 = LLMTestCase(
-        input="dsp_report 和 brainx_report 内容一样，查哪个都行对吧？",
-        context=["明确纠正：不是查哪个都行 | dsp_report：DSP 内部细维度分析 | brainx_report：客户视角天级汇总 | 应根据场景选表"],
-        retrieval_context=["根据提供的文档，这种说法是**不正确**的。`dsp_report` 和 `brainx_report` 的用途不同，应根据具体查询场景选择。\n\n### 默认选表方向\n\n文档 `warmup.md` 和 `warmup.backup-2026-04-02.md` 中明确指出了两张表的区别和优先使用场景：\n\n*   **`default_catalog.ads_brainx.brainx_report`**:\n    *   **客户视角**、标准效果报表、天级分析时优先使用。\n\n*   **`default_catalog.ads.dsp_report`**:\n    *   **DSP 内部视角**、细维度分析、复杂排查时优先使用。\n\n因此，您应当根据分析的目的（是站在客户视角看标准报表，还是在 DSP 内部进行深度排查）来选择合适的表，而不是认为它们可以随意替换。"]
-    )
-
-    test_case5 = LLMTestCase(
-        input="用户问某广搞主昨天花废多少，未特别说明口经。默认应该使用哪个字段？",
-        expected_output="能识别'广搞主'为'广告主' | 能识别'花废'为'花费' | 能识别'口经'为'口径' | 默认口径是平台消耗 | 字段应为 price_total / 1000",
-        retrieval_context=["### 查询广告主花费的默认字段\n\n当查询广告主昨日花费且未特别说明口径时，应默认使用 `adv_spend_not_rt` 字段。\n\n- **推荐字段**: `adv_spend_not_rt`\n  - **定义**: 该字段是当前正在使用的“广告主消耗”，即广告主支付给DSP平台的广告花费。\n- **废弃字段**: `adv_spend`\n  - **状态**: 此字段已被标记为“废弃”，为确保数据准确性，不应再使用。\n\n此结论基于知识库文档 `表结构: default_catalog.ads_brainx.brainx_report` 的描述。"]
-    )   
-
-    test = "编造具体创建日期 | 推测创建时间 | 假装查询了元数据"
-    test_case6 = LLMTestCase(
-        input="default_catalog.ads.dsp_report 表是什么时候创建的？",
-        expected_output="明确说明知识库没有表创建时间信息 | 可以说明表的用途和结构 | 不应编造创建时间",
-        context=test.split('|'),
-        retrieval_context=["### `default_catalog.ads.dsp_report` 表创建时间分析\n\n根据现有资料，无法直接确定 `default_catalog.ads.dsp_report` 表本身的确切创建时间。\n\n不过，文档提供了与表中**数据创建时间**相关的字段信息：\n\n*   **`create_time`**:\n    *   **类型**: `varchar(20)`\n    *   **角色**: 表的分区键\n    *   **描述**: 代表表中数据的创建时间，格式为 `'YYYY-MM-DD_HH'`。\n\n*   **`create_date`**:\n    *   **类型**: `datetime`\n    *   **描述**: 代表数据的创建日期，格式为 `'YYYY-MM-DD HH:MM:SS'`。\n\n**结论**：已有的信息关注的是表中**行数据**的创建时间，而非表结构的创建时间。"]
-    )   
-
-    # evaluate([test_case, test_case2, test_case3], [reverse_validation_metric])
-    # evaluate([test_case5], [reverse_validation_metric])
-    # evaluate([test_case5], [contextual_recall_metric])
-    evaluate([test_case6], [reverse_validation_metric, contextual_recall_metric])
-    # for tr in resualt.test_results:
-    #     pass
-    # print(resualt)
+# precision@k
+precision_k_threshold = conf_reader.get('metric_conf.precision_k.threshold', 0.6)
+precision_k_topk = conf_reader.get('metric_conf.precision_k.topk', 5)
+precisionk_metric = PrecisionK(threshold=precision_k_threshold, topk=precision_k_topk)

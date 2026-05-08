@@ -8,8 +8,8 @@ import argparse
 import os
 
 from agents.http_agent import HTTPAgent
-from tool import AsyncResultWriter, CsvReader, CsvWriter, ConfigReader, MarkdownWriter
-from evaluator.metrics import reverse_validation_metric, contextual_recall_metric
+from tool import AsyncResultWriter, CsvReader, ConfigReader, MarkdownWriter
+from evaluator.metrics import reverse_validation_metric, contextual_recall_metric, mrr_metric, recallk_metric, precisionk_metric
 from tool.collection_result import CollectionResult
 
 
@@ -17,7 +17,10 @@ TEST_SUITE_MAP = {}
 
 METRICS_MAP = {
     'reverse_validation': reverse_validation_metric,
-    'contextual_recall': contextual_recall_metric
+    'contextual_recall': contextual_recall_metric,
+    'mrr': mrr_metric,
+    'recallk': recallk_metric,
+    'precisionk': precisionk_metric
 }
 
 def parse_args():

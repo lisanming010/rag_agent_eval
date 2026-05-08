@@ -3,7 +3,7 @@ agents:
   # 使用何种形式接入agent
   type: http 
   http_agent:
-    endpoint: http://xxxxx
+    endpoint: https://xxxx
     mode: FAST
     # 最高调用并发
     call_agent_th_max: 8
@@ -15,9 +15,21 @@ judge_llm:
     temperature: 0
     max_token: 4096
 
-# 不同的metrics通过阈值设置
-judge_thresholds:
-  contextual_recall: 0.7
+# 不同的metrics配置
+metric_conf:
+  contextual_recall: 
+    threshold: 0.7
+  reverse_validation:
+    threshold: 0.7
+  mrr:
+    threshold: 0.7
+    topk: 0
+  recall_k:
+    threshold: 0.8
+    topk: 5
+  precision_k:
+    threshold: 0.6 
+    topk: 5
 
 # 评价器配置
 evluate:
@@ -26,7 +38,7 @@ evluate:
   # 最大并发数量
   max_concurrent: 10
   # 提交间隔s
-  throttle_value: 0
+  throttle_value: 1
 
 dataset:
   # 测试用例集存放路径，可以指定文件夹也可以指定具体某个测试用例集csv文件
