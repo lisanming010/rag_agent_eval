@@ -56,7 +56,7 @@ class CollectionResult:
 
         result_list = self.csv_reader.read_rows()
         for result in result_list:
-            res_time_list.append(result['res_time(s)'])
+            res_time_list.append(float(result['res_time(s)']))
 
         res_time_result_dict['任务最长耗时'] = max(res_time_list)
         res_time_result_dict['任务耗时平均值'] = np.mean(res_time_list)

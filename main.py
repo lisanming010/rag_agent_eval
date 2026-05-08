@@ -8,7 +8,7 @@ import argparse
 import os
 
 from agents.http_agent import HTTPAgent
-from tool import AsyncResultWriter, CsvReader, CsvWriter, ConfigReader
+from tool import AsyncResultWriter, CsvReader, CsvWriter, ConfigReader, MarkdownWriter
 from evaluator.metrics import reverse_validation_metric, contextual_recall_metric
 from tool.collection_result import CollectionResult
 
@@ -244,7 +244,10 @@ if __name__ == "__main__":
         writer.wait_and_stop()
         print(writer.get_stats())
 
-        # 汇总测试结果
+        # 汇总测试结果，输出报告
+        report_name = 'test_report.md'
+        report_path = os.path.join(base_path, report_name)
+        md_writer = MarkdownWriter(report_path)
         for file in os.listdir(base_path):
             if file.endswith('.csv') and 'result_outputs_' in file:
                 result_csv_path = os.path.join(base_path, file)
@@ -252,17 +255,13 @@ if __name__ == "__main__":
 
                 # 任务执行结果汇总统计
                 task_success_stat = collection_result.task_success_stats()
-                print("\n========任务执行结果统计==========")
-                for k, v in task_success_stat:
-                    print(f'{k}: {v}')
                 
                 # 响应时间结果汇总统计
                 res_time = collection_result.res_time()
-                print("\n========响应时间统计==========")
-                for k, v in res_time:
-                    print(f'{k}: {v}')
 
-                        
+                # 写入报告
+                md_writer.write_report(file, task_success_stat, res_time)
+         
     else:
         # TODO: 非HTTP调用的agent接入注册位置
         pass

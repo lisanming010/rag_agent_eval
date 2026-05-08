@@ -4,11 +4,13 @@ from .async_result_writer import AsyncResultWriter
 from .collection_result import CollectionResult
 from .csv_reader import CsvReader
 from .csv_writer import CsvWriter
+from .markdown_writer import MarkdownWriter
 
 __all__ = [
     "ConfigReader",
     "AsyncResultWriter",
     "CollectionResult",
     "CsvReader",
-    "CsvWriter"
+    "CsvWriter",
+    "MarkdownWriter",
 ]
