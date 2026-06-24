@@ -10,3 +10,6 @@ result/*
 */__pycache__/*
 deepeval_custom_metrics.md
 test.py
+auth_state.json
+raw_konwledge/*
+!raw_konwledge/.gitkeep

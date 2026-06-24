@@ -12,6 +12,7 @@ pyyaml = "*"
 anthropic = "*"
 json-repair = "*"
 numpy = "*"
+playwright = "*"
 
 [dev-packages]
 

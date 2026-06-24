@@ -5,6 +5,7 @@ from .collection_result import CollectionResult
 from .csv_reader import CsvReader
 from .csv_writer import CsvWriter
 from .markdown_writer import MarkdownWriter
+from .playwright_login import PlaywrightLogin, AuthState, ensure_logged_in
 
 __all__ = [
     "ConfigReader",
@@ -13,4 +14,7 @@ __all__ = [
     "CsvReader",
     "CsvWriter",
     "MarkdownWriter",
+    "PlaywrightLogin",
+    "AuthState",
+    "ensure_logged_in",
 ]
