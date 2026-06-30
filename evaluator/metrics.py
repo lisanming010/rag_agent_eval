@@ -29,7 +29,7 @@ class CreateMetrics:
 
     def create_contextual_recall_metric(self, threshold=0.7) -> ContextualRecallMetric:
         """
-        创建ContextualRecall metric
+        创建ContextualRecall metric，评价召回是否全面
 
         :params: threshold: 通过阈值
         """
@@ -218,6 +218,7 @@ reverse_validation_metric = createmetrics.create_metric_base_geval(
     criteria="retrieval_context中不应该包含context中的关键信息",
     evaluation_params=["input", "retrieval_context", "context"],
     evaluation_steps= [
+        "若retrieval_context中有‘**来源**：大模型通用知识’字段，则跳过后续判断步骤将此条视作通过"
         "context是禁止条例，是retrieval_context中不应该体现的内容或执行的操作",
         # "阅读context,其中的关键信息之间使用’｜’分割",
         "context中信息可能是肯定或否定的陈述，你应当理解肯定的陈述默认是缺省了’不应该’，如：’认为xxx’实际应该按照’不应该认为xxx’来理解",

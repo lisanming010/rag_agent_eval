@@ -7,29 +7,41 @@
 ```text
 .
 ├── agents/                        # Agent 注册目录
+│   ├── __init__.py                # 包初始化
+│   ├── factory.py                 # Agent 工厂（根据配置创建实例）
 │   └── http_agent.py              # HTTP 方式调用待测 Agent
-├── evaluator/                     # LLM-as-Judge 注册目录
+├── evaluator/                     # LLM-as-Judge 评测层
 │   ├── claud_judge_llm.py         # Claude Judge 模型封装
 │   ├── deepeval_patch.py          # deepeval/anthropic 兼容性 patch
-│   └── metrics.py                 # 自定义评测指标注册与构造
+│   ├── metrics.py                 # 自定义评测指标注册与构造
+│   └── runner.py                  # 评测执行器（evaluate 调用 + 重试 + 结果回写）
+├── pipeline/                      # 流水线模块
+│   ├── __init__.py                # 包初始化
+│   └── test_case_loader.py        # 测试用例加载器（CSV 解析 → 用例列表）
 ├── result/                        # 评测结果输出目录                 
-├── test_suite/                    # 测试数据集存放目录
-│   ├── test_cases_base.csv        # 基础测试集
+├── test/                          # 测试数据集存放目录
+│   ├── test_cases_normal.csv      # 基础测试集
 │   ├── test_cases_hallucination.csv  # 幻觉测试集
 │   ├── test_cases_inference.csv   # 推理测试集
+│   ├── test_cases_retrieval.csv   # 检索测试集
 │   ├── test_cases_robustness.csv  # 鲁棒性测试集
-│   └── *.json                     # 对应的 JSON 数据
+│   └── test_cases_multiturn.csv   # 多轮对话测试集
 ├── tool/                          # 工具模块
 │   ├── __init__.py                # 工具模块导出
 │   ├── async_result_writer.py     # 异步结果写入器
 │   ├── collection_result.py       # 结果统计分析工具
-│   ├── config_reader.py           # 配置读取工具(单例)
-│   ├── markdown_writer.py         # 结果md输出工具
+│   ├── concurrency.py             # 通用线程池调度
+│   ├── config_reader.py           # 配置读取工具（单例）
 │   ├── csv_reader.py              # CSV 读取工具
-│   └── csv_writer.py              # CSV 写入工具
+│   ├── csv_writer.py              # CSV 写入工具
+│   ├── file_utils.py              # 通用文件系统工具
+│   ├── markdown_writer.py         # Markdown 报告输出
+│   ├── playwright_login.py        # Playwright 登录工具
+│   └── get_bad_cases.py           # 失败用例提取工具
 ├── .env.example                   # 环境变量示例
 ├── config.yaml.example            # 配置文件示例
-├── main.py                        # 主执行入口
+├── config.yaml                    # 项目配置
+├── main.py                        # 主入口（CLI + EvaluationPipeline）
 ├── Pipfile                        # Python 依赖定义
 ├── requirements.txt               # pip 依赖列表
 └── README.md                      # 项目文档

@@ -56,12 +56,21 @@ class CollectionResult:
 
         result_list = self.csv_reader.read_rows()
         for result in result_list:
-            res_time_list.append(float(result['res_time(s)']))
+            val = result.get('res_time(s)', '').strip()
+            if not val:
+                continue
+            res_time_list.append(float(val))
 
-        res_time_result_dict['任务最长耗时'] = max(res_time_list)
-        res_time_result_dict['任务耗时平均值'] = np.mean(res_time_list)
-        res_time_result_dict['任务耗时p99'] = np.percentile(res_time_list, 99)
-        res_time_result_dict['任务耗时p95'] = np.percentile(res_time_list, 95)
+        if not res_time_list:
+            res_time_result_dict['任务最长耗时'] = 0
+            res_time_result_dict['任务耗时平均值'] = 0
+            res_time_result_dict['任务耗时p99'] = 0
+            res_time_result_dict['任务耗时p95'] = 0
+        else:
+            res_time_result_dict['任务最长耗时'] = max(res_time_list)
+            res_time_result_dict['任务耗时平均值'] = np.mean(res_time_list)
+            res_time_result_dict['任务耗时p99'] = np.percentile(res_time_list, 99)
+            res_time_result_dict['任务耗时p95'] = np.percentile(res_time_list, 95)
 
         return res_time_result_dict
         
