@@ -14,3 +14,6 @@ auth_state.json
 __MACOSX/
 raw_konwledge/*
 !raw_konwledge/.gitkeep
+log/*
+!log/.gitkeep
+__pycache__/main.cpython-312.pyc

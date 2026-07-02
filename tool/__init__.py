@@ -1,5 +1,6 @@
 """工具模块"""
 from .config_reader import ConfigReader
+from .log_factory import LogFactory
 from .async_result_writer import AsyncResultWriter
 from .collection_result import CollectionResult
 from .csv_reader import CsvReader
@@ -9,6 +10,7 @@ from .playwright_login import PlaywrightLogin, AuthState, ensure_logged_in
 
 __all__ = [
     "ConfigReader",
+    "LogFactory",
     "AsyncResultWriter",
     "CollectionResult",
     "CsvReader",

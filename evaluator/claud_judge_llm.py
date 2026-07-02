@@ -13,48 +13,60 @@ load_dotenv()
 patch_anthropic_model()
 
 class ClaudJudgeLLM:
-    """实例化基于claude模型"""
+    """实例化基于claude模型，支持多模型实例缓存（按 model_name 隔离）"""
+
     def __init__(self):
         self.base_url = os.getenv("ANTHROPIC_BASE_URL")
         self.auth_token = os.getenv("ANTHROPIC_AUTH_TOKEN")
-        self.model = None
+        self._models: dict[str, AnthropicModel] = {}
+        self._openai_models: dict[str, GPTModel] = {}
 
-    def get_model(self):
-        """懒加载模型实例"""
-        configreader = ConfigReader.get_instance()
-        model_name = configreader.get("judge_llm.anthropic.model")
-        model_temperature = configreader.get("judge_llm.anthropic.temperature")
-        model_max_token = configreader.get("judge_llm.anthropic.max_token")
+    def get_model(self, model_name: str | None = None):
+        """
+        懒加载模型实例
 
-        if self.model is None:
-            self.model = AnthropicModel(
+        :param model_name: 可选指定模型名称，不传则使用配置文件默认 model
+        """
+        if model_name is None:
+            model_name = ConfigReader.get_instance().get("judge_llm.anthropic.model")
+
+        if model_name not in self._models:
+            configreader = ConfigReader.get_instance()
+            model_temperature = configreader.get("judge_llm.anthropic.temperature")
+            model_max_token = configreader.get("judge_llm.anthropic.max_token")
+
+            self._models[model_name] = AnthropicModel(
                 model=model_name,
                 base_url=self.base_url,
                 api_key=self.auth_token,
                 temperature=model_temperature,
                 max_tokens=model_max_token,
             )
-        return self.model
- 
-    def get_model_openai(self):
+        return self._models[model_name]
+
+    def get_model_openai(self, model_name: str | None = None):
         """
         懒加载模型实例，使用OpenAI兼容格式调用,原生AnthropicModel可能会出现'Thinking block error'
-        """
-        configreader = ConfigReader.get_instance()
-        model_name = configreader.get("judge_llm.anthropic.model")
-        model_temperature = configreader.get("judge_llm.anthropic.temperature")
 
-        if self.model is None:
-            self.model = GPTModel(
+        :param model_name: 可选指定模型名称，不传则使用配置文件默认 model
+        """
+        if model_name is None:
+            model_name = ConfigReader.get_instance().get("judge_llm.anthropic.model")
+
+        if model_name not in self._openai_models:
+            configreader = ConfigReader.get_instance()
+            model_temperature = configreader.get("judge_llm.anthropic.temperature")
+
+            self._openai_models[model_name] = GPTModel(
                 model=model_name,
                 base_url=self.base_url + "/v1",
                 api_key=self.auth_token,
                 temperature=model_temperature,
                 generation_kwargs={
-                "response_format": {"type": "json_object"}
+                    "response_format": {"type": "json_object"}
                 }
             )
-        return self.model
+        return self._openai_models[model_name]
 
     def create_metric(self, threshold=0.7):
         """创建基于claude judge的评测指标"""
@@ -95,6 +107,7 @@ if __name__ == "__main__":
         retrieval_context=[ac_output]
     )
 
-    claude_judge = ClaudJudgeLLM()
-    metric = claude_judge.create_contextual_recall_metric(threshold=0.7)
+    claude_judge = ClaudJudgeLLM().get_model('Minimax/Minimax-M2.5')
+    metric = ContextualRecallMetric(model=claude_judge, threshold=0.7)
+    # metric = claude_judge.create_contextual_recall_metric(threshold=0.7)
     evaluate([test_case], [metric])

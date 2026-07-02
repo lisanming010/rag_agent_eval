@@ -24,8 +24,12 @@ TESTCASE_PARAMS_MAP = {
 
 class CreateMetrics:
     """评测指标类，负责创建和管理内置的或基于GEval的自定义评测指标实例"""
-    def __init__(self):
-        self.model = ClaudJudgeLLM().get_model()
+
+    def __init__(self, model_name: str | None = None):
+        """
+        :param model_name: 可选指定评测模型名称，不传则使用配置文件默认 model
+        """
+        self.model = ClaudJudgeLLM().get_model(model_name)
 
     def create_contextual_recall_metric(self, threshold=0.7) -> ContextualRecallMetric:
         """
@@ -207,32 +211,47 @@ class PrecisionK(RetrievalKMetricBase):
         return "PrecisionK"
 
 conf_reader = ConfigReader.get_instance()
-# metric创建，单例
-createmetrics = CreateMetrics()
 
-# 自定义反向验证指标，测试数据集中的negative_criteria字段
-# 可以作为幻觉评测
-reverse_validation_thresholds = conf_reader.get('metric_conf.reverse_validation.threshold', 0.7)
-reverse_validation_metric = createmetrics.create_metric_base_geval(
-    name="reverse_validation_metric",
-    criteria="retrieval_context中不应该包含context中的关键信息",
-    evaluation_params=["input", "retrieval_context", "context"],
-    evaluation_steps= [
-        "若retrieval_context中有‘**来源**：大模型通用知识’字段，则跳过后续判断步骤将此条视作通过"
-        "context是禁止条例，是retrieval_context中不应该体现的内容或执行的操作",
-        # "阅读context,其中的关键信息之间使用’｜’分割",
-        "context中信息可能是肯定或否定的陈述，你应当理解肯定的陈述默认是缺省了’不应该’，如：’认为xxx’实际应该按照’不应该认为xxx’来理解",
-        "理解context中的各关键信息",
-        "执行比较，如果retrieval_context中体现了任一不该体现的信息则判定违禁，打分0分",
-        "如果retrieval_context中也明确禁止了context中禁止的的操作例如：context中有：’不应该xxx’，在retrieval_context中也有’禁止xxx’或类似表述则不视为违禁，打分100分",
-        "如果retrieval_context中没有体现禁止项则视为未违禁，比如：context中有：’不应该A’，retrieval_context中做了B、C则也同样视为不违禁，打分100分"
-    ],
-    threshold=reverse_validation_thresholds
-)
 
-# ContextualRecallMetric metics 
-contextual_recall_threshold = conf_reader.get('metric_conf.contextual_recall.threshold', 0.7)
-contextual_recall_metric = createmetrics.create_contextual_recall_metric(threshold=contextual_recall_threshold)
+def create_metrics_for_model(model_name: str | None, metric_names: list[str]) -> dict:
+    """
+    为指定模型创建 LLM 评测指标实例，非 LLM 类指标自动跳过。
+    统一工厂，model1/model2/model3 均走此入口。
+
+    :param model_name: 评测模型名称，传 None 则使用配置文件默认 model
+    :param metric_names: 需要创建的指标名称列表
+    :return: {metric_name: metric_instance}
+    """
+    factory = CreateMetrics(model_name=model_name)
+    result: dict = {}
+
+    for name in metric_names:
+        if name == 'reverse_validation':
+            threshold = conf_reader.get('metric_conf.reverse_validation.threshold', 0.7)
+            result[name] = factory.create_metric_base_geval(
+                name="reverse_validation_metric",
+                criteria="retrieval_context中不应该包含context中的关键信息",
+                evaluation_params=["input", "retrieval_context", "context"],
+                evaluation_steps=[
+                    "步骤一：retrieval_context是待评测的大模型的实际输出，context是禁止条例，不希望大模型输出中包含的内容",
+                    "步骤二：若retrieval_context中有'来源：大模型通用知识'字段标识且仅有该字段，则直接认为该条输出合法，不再执行后续步骤也不再判断禁止条例，判断为满分后退出评价。其余'来源：xxx'只要不是'大模型通用知识'的都不适用于该步骤的豁免条件正常执行后续步骤判断。",
+                    "步骤三：context中信息可能是肯定或否定的陈述，你应当理解肯定的陈述默认是缺省了'不应该'，如：'认为xxx'实际应该按照'不应该认为xxx'来理解",
+                    "步骤四：执行比较，如果retrieval_context中体现了任一不该体现的信息则判定违禁，打分0分",
+                    "步骤五：如果retrieval_context中也明确禁止了context中禁止的的操作例如：context中有：'不应该xxx'，在retrieval_context中也有'禁止xxx'或类似表述则不视为违禁，打分满分",
+                    "步骤六：如果retrieval_context中没有体现禁止项则视为未违禁，比如：context中有：'不应该A'，retrieval_context中做了B、C则也同样视为不违禁，打分满分"
+                ],
+                threshold=threshold
+            )
+        elif name == 'contextual_recall':
+            threshold = conf_reader.get('metric_conf.contextual_recall.threshold', 0.7)
+            result[name] = factory.create_contextual_recall_metric(threshold=threshold)
+    return result
+
+
+# 默认模型（model1）LLM 指标单例，统一走工厂
+_default_llm_metrics = create_metrics_for_model(None, ['reverse_validation', 'contextual_recall'])
+reverse_validation_metric = _default_llm_metrics['reverse_validation']
+contextual_recall_metric = _default_llm_metrics['contextual_recall']
 
 # MRRmteric
 mrr_threshold = conf_reader.get('metric_conf.mrr.threshold', 0.7)

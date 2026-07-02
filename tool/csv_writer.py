@@ -30,9 +30,15 @@ class CsvWriter:
         if not data:
             raise ValueError("数据列表不能为空")
 
-        # 自动提取字段名
+        # 汇总所有行的全部字段名（避免首行缺失后续行独有的列被截断）
         if fieldnames is None:
-            fieldnames = list(data[0].keys())
+            fieldnames_set: dict[str, None] = {}
+            fieldnames = []
+            for row in data:
+                for key in row:
+                    if key not in fieldnames_set:
+                        fieldnames_set[key] = None
+                        fieldnames.append(key)
 
         # 确保父目录存在
         self.csv_path.parent.mkdir(parents=True, exist_ok=True)

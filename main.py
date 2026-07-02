@@ -10,10 +10,12 @@ from tool.file_utils import mkdir_with_timestamp
 from tool import AsyncResultWriter, MarkdownWriter
 from tool.collection_result import CollectionResult
 from tool.get_bad_cases import extract_bad_cases
+from tool.log_factory import LogFactory
 from agents.factory import create_agent
 from pipeline.test_case_loader import make_test_case_list
-from evaluator.runner import run_evaluate
+from evaluator.runner import run_evaluate, run_multimodel_reevaluate
 
+logger = LogFactory.get_logger(__name__)
 
 #CLI 
 def parse_args():
@@ -41,9 +43,12 @@ def parse_args():
 #Agent 调用薄函数
 def call_agent(agent, test_case_csv: dict):
     """agent调用入口，将agent响应并入原有字典中"""
-    _, answer_summary, res_time = agent.call_agent(test_case_csv['query'])
+    logger.info(f'call_agent,qurey:{test_case_csv['query']}')
+    answer_raw, answer_summary, res_time = agent.call_agent(test_case_csv['query'])
     test_case_csv['agent_response'] = answer_summary
     test_case_csv['res_time(s)'] = res_time
+    logger.debug(answer_raw)
+    logger.info(f'qurey:{test_case_csv['query']}请求完毕')
 
 
 def make_llm_case(test_case_csv: dict):
@@ -52,8 +57,10 @@ def make_llm_case(test_case_csv: dict):
     agent_response 缺失时（call_agent 失败）跳过该用例，写入错误标记。
     """
     if 'agent_response' not in test_case_csv:
-        print(f"[跳过] query='{test_case_csv.get('query', '?')[:60]}' "
-              f"agent_response 缺失，无法组装 LLMTestCase")
+        logger.debug(
+            f"[跳过] query='{test_case_csv.get('query', '?')[:60]}' "
+            f"agent_response 缺失，无法组装 LLMTestCase"
+        )
         test_case_csv['is_success'] = False
         test_case_csv['evaluate_error'] = 'Agent调用失败，无agent_response'
         return
@@ -61,7 +68,7 @@ def make_llm_case(test_case_csv: dict):
     llm_test_case = LLMTestCase(
         input=test_case_csv['query'],
         expected_output=test_case_csv.get('expected_behavior', ''),
-        context=test_case_csv.get('negative_criteria', []),
+        context=[test_case_csv.get('forbidden_behavior', '')],
         retrieval_context=[test_case_csv['agent_response']]
     )
     test_case_csv['llm_test_case'] = llm_test_case
@@ -88,15 +95,22 @@ class EvaluationPipeline:
 
     #阶段2: Agent 并发调用 + 组装 LLM 用例
     def _invoke_agents(self, test_cases_list: list[dict]):
+        """
+        :param test_cases_list: [{csv: [dict], case_name: str, metrics: [str]}, ...]
+        """
         agent = create_agent()
+        # 每个csv表中的每一行
         all_cases = [
             case for cases in test_cases_list for case in cases['csv']
         ]
+
         max_worker = self.conf.get("agents.http_agent.call_agent_th_max")
+        submit_delay = self.conf.get("agents.http_agent.submit_delay", 0)
 
         run_in_thread_pool(
             partial(call_agent, agent), all_cases,
-            max_workers=max_worker, task_name="call_agent"
+            max_workers=max_worker, submit_delay=submit_delay,
+            task_name="call_agent"
         )
         run_in_thread_pool(
             make_llm_case, all_cases,
@@ -107,9 +121,9 @@ class EvaluationPipeline:
         ok = sum(1 for c in all_cases if 'llm_test_case' in c)
         ng = len(all_cases) - ok
         if ng:
-            print(f"[阶段2] Agent调用/用例组装: 成功 {ok}, 失败 {ng} (共 {len(all_cases)})")
+            logger.info(f"[阶段2] Agent调用/用例组装: 成功 {ok}, 失败 {ng} (共 {len(all_cases)})")
         else:
-            print(f"[阶段2] Agent调用/用例组装: 全部成功 ({len(all_cases)} 条)")
+            logger.info(f"[阶段2] Agent调用/用例组装: 全部成功 ({len(all_cases)} 条)")
 
     #阶段3: 评测执行 + 结果写入
     def _evaluate(self, test_cases_list: list[dict]) -> str:
@@ -121,6 +135,7 @@ class EvaluationPipeline:
 
         for test_case in test_cases_list:
             run_evaluate(test_case)
+            run_multimodel_reevaluate(test_case)
             writer.submit(test_case, test_case['case_name'])
 
         writer.wait_and_stop()
