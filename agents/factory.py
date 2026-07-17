@@ -1,26 +1,56 @@
 """Agent工厂，根据配置创建对应的Agent实例"""
 
-from agents.http_agent import PVAssistant
+from agents.http_agent import PVAssistant, Diagnosis, DataQA
 from tool.config_reader import ConfigReader
 
-def create_agent():
+# 类名 → 类的注册表，扩展新 Agent 类型时在此注册
+AGENT_CLASS_MAP = {
+    'PVAssistant': PVAssistant,
+    'Diagnosis': Diagnosis,
+    'DataQA': DataQA,
+}
+
+
+def create_agent(class_name: str):
     """
-    根据配置文件 agents.type 创建对应的 Agent 实例
+    根据类名创建对应的 Agent 实例
 
-    扩展新 Agent 类型时只需在此添加分支:
+    配置从 agents.http_agent.class_config.<class_name> 读取。
+
+    扩展新 Agent 类型时只需:
       - 实现新的 Agent 类
-      - 在 config.yaml 中配置对应的参数
-      - 在此添加 elif 分支
+      - 在 AGENT_CLASS_MAP 中注册
+      - 在 config.yaml 的 class_config 中添加对应配置
 
+    :param class_name: Agent 类名，如 'PVAssistant'、'Diagnosis'
     :return: Agent 实例
     """
     conf = ConfigReader.get_instance()
-    agent_type = conf.get('agents.type')
+    cls = AGENT_CLASS_MAP.get(class_name)
+    if cls is None:
+        raise NotImplementedError(f'不支持的 agent 类: {class_name}')
 
-    if agent_type == 'http':
-        return PVAssistant(
-            base_url=conf.get('agents.http_agent.endpoint'),
-            business_token=conf.get('agents.http_agent.business_token')
-        )
+    endpoint = conf.get(f'agents.http_agent.class_config.{class_name}.endpoint')
+    business_token = conf.get(f'agents.http_agent.class_config.{class_name}.business_token', None)
 
-    raise NotImplementedError(f'不支持的 agent 类型: {agent_type}')
+    return cls(base_url=endpoint, business_token=business_token)
+
+
+def get_enabled_classes(cli_classes: list[str] | None = None) -> list[str]:
+    """
+    获取本次应执行的 agent 类列表
+
+    优先级: CLI -a 参数 > 配置文件中 enabled == true 的类
+
+    :param cli_classes: CLI 指定的类名列表，None 时从配置读取
+    :return: 应执行的类名列表
+    """
+    conf = ConfigReader.get_instance()
+    if cli_classes:
+        return cli_classes
+
+    all_classes = list(conf.get('agents.http_agent.class_config', {}).keys())
+    return [
+        c for c in all_classes
+        if conf.get(f'agents.http_agent.class_config.{c}.enabled', False)
+    ]

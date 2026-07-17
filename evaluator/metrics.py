@@ -2,6 +2,8 @@
 # from pathlib import Path
 # sys.path.insert(0, str(Path(__file__).parent.parent))
 
+import json
+
 from deepeval.metrics import ContextualRecallMetric, GEval, BaseMetric
 from deepeval.test_case import LLMTestCaseParams, LLMTestCase
 
@@ -210,6 +212,126 @@ class PrecisionK(RetrievalKMetricBase):
     def __name__(self):
         return "PrecisionK"
 
+
+class DataQACapabilityMetric(BaseMetric):
+    """校验 DataQA 意图路由是否正确 — 预期 capability_id 与实际返回的是否一致，非 LLM"""
+
+    def __init__(self, threshold: float = 1.0):
+        self.threshold = threshold
+
+    def measure(self, test_case: LLMTestCase) -> float:
+        """
+        expected_output: 预期 capability_id 字符串，如 "Station_power"
+        retrieval_context[0]: 实际 capability_id 字符串
+        """
+        expected = (test_case.expected_output or '').strip()
+        actual = ''
+        if test_case.retrieval_context:
+            actual = (test_case.retrieval_context[0] or '').strip()
+
+        self.score = 1.0 if expected and actual and expected == actual else 0.0
+        self.success = self.score >= self.threshold
+
+        if not expected:
+            self.reason = f'预期 capability_id 为空，实际={actual}'
+        elif self.score == 1.0:
+            self.reason = f'capability_id 匹配: {actual}'
+        else:
+            self.reason = f'capability_id 不匹配: 期望={expected}, 实际={actual}'
+        return self.score
+
+    async def a_measure(self, test_case: LLMTestCase) -> float:
+        return self.measure(test_case)
+
+    def is_successful(self):
+        return self.success
+
+    @property
+    def __name__(self):
+        return "DataQA_Capability"
+
+
+class DataQAParamsMetric(BaseMetric):
+    """校验 DataQA 参数提取是否正确 — 预期参数集是否为实际参数集的子集，非 LLM"""
+
+    def __init__(self, threshold: float = 1.0):
+        self.threshold = threshold
+
+    def measure(self, test_case: LLMTestCase) -> float:
+        """
+        expected_output: 预期参数字典的 JSON 字符串，如 '{"siteId":"Win Win"}'
+        retrieval_context[0]: 实际参数字典的 JSON 字符串
+        判定: expected ⊆ actual
+        """
+        expected_raw = (test_case.expected_output or '').strip()
+        actual_raw = ''
+        if test_case.retrieval_context:
+            actual_raw = (test_case.retrieval_context[0] or '').strip()
+
+        # 解析两个 JSON 字典
+        expected_dict: dict = {}
+        actual_dict: dict = {}
+        try:
+            expected_dict = json.loads(expected_raw) if expected_raw else {}
+        except json.JSONDecodeError:
+            self.score = 0.0
+            self.success = False
+            self.reason = f'expected_parameters JSON 解析失败: {expected_raw[:200]}'
+            return 0.0
+        try:
+            actual_dict = json.loads(actual_raw) if actual_raw else {}
+        except json.JSONDecodeError:
+            self.score = 0.0
+            self.success = False
+            self.reason = f'actual_parameters JSON 解析失败: {actual_raw[:200]}'
+            return 0.0
+
+        if not expected_dict:
+            self.score = 1.0
+            self.success = True
+            self.reason = '无预期参数，跳过校验'
+            return 1.0
+
+        # 子集比对: expected ⊆ actual
+        matched: list[str] = []
+        mismatched: list[str] = []
+        for key, expected_val in expected_dict.items():
+            actual_val = actual_dict.get(key)
+            if actual_val is not None and str(actual_val) == str(expected_val):
+                matched.append(f'{key}={expected_val}')
+            else:
+                mismatched.append(
+                    f'{key}: 期望={expected_val}, 实际={actual_val}'
+                )
+
+        total = len(expected_dict)
+        hit_count = len(matched)
+        self.score = hit_count / total
+
+        threshold_to_use = self.threshold
+        # 当 threshold=1.0 时，要求全部匹配
+        self.success = hit_count == total if threshold_to_use >= 1.0 else self.score >= threshold_to_use
+
+        if mismatched:
+            self.reason = (
+                f'匹配: [{"; ".join(matched)}]; '
+                f'不匹配: [{"; ".join(mismatched)}]'
+            ) if matched else f'不匹配: [{"；".join(mismatched)}]'
+        else:
+            self.reason = f'全部匹配 ({total}/{total}): [{"; ".join(matched)}]'
+        return self.score
+
+    async def a_measure(self, test_case: LLMTestCase) -> float:
+        return self.measure(test_case)
+
+    def is_successful(self):
+        return self.success
+
+    @property
+    def __name__(self):
+        return "DataQA_Params"
+
+
 conf_reader = ConfigReader.get_instance()
 
 
@@ -267,3 +389,11 @@ recallk_metric = RecallK(threshold=recall_k_threshold, topk=recall_k_topk)
 precision_k_threshold = conf_reader.get('metric_conf.precision_k.threshold', 0.6)
 precision_k_topk = conf_reader.get('metric_conf.precision_k.topk', 5)
 precisionk_metric = PrecisionK(threshold=precision_k_threshold, topk=precision_k_topk)
+
+# DataQA capability
+dataqa_capability_threshold = conf_reader.get('metric_conf.dataqa_capability.threshold', 1.0)
+dataqa_capability_metric = DataQACapabilityMetric(threshold=dataqa_capability_threshold)
+
+# DataQA params
+dataqa_params_threshold = conf_reader.get('metric_conf.dataqa_params.threshold', 1.0)
+dataqa_params_metric = DataQAParamsMetric(threshold=dataqa_params_threshold)

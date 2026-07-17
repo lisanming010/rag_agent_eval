@@ -107,7 +107,7 @@ if __name__ == "__main__":
         retrieval_context=[ac_output]
     )
 
-    claude_judge = ClaudJudgeLLM().get_model('Minimax/Minimax-M2.5')
+    claude_judge = ClaudJudgeLLM().get_model('ZhipuAI/GLM-4.7-Flash')
     metric = ContextualRecallMetric(model=claude_judge, threshold=0.7)
     # metric = claude_judge.create_contextual_recall_metric(threshold=0.7)
     evaluate([test_case], [metric])

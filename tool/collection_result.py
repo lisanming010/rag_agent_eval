@@ -31,14 +31,26 @@ class CollectionResult:
             task_success_count[metric] = 0
 
         results_list = self.csv_reader.read_rows()
-        total_task_count = len(results_list) 
+        total_task_count = len(results_list)
 
         for result in results_list:
-            if result['is_success'] == "True":
+            # is_success 是整体标识（单轮直接取，多轮合并行由 _aggregate_multi_turn 统一）
+            if str(result.get('is_success', '')).strip().upper() == 'TRUE':
                 task_success_count['total'] += 1
             for metric in metrics:
-                if result[f'{metric}_is_success'] == "True":
-                    task_success_count[metric] += 1
+                metric_key = f'{metric}_is_success'
+                metric_val = result.get(metric_key)
+                if metric_val is not None:
+                    if str(metric_val).strip().upper() == 'TRUE':
+                        task_success_count[metric] += 1
+                else:
+                    # 多轮合并行：检查 *_is_success(t1), *_is_success(t2) ... 全部通过才算通过
+                    turn_vals = [
+                        v for k, v in result.items()
+                        if k.startswith(metric_key + '(') and '_model' not in k
+                    ]
+                    if turn_vals and all(str(v).strip().upper() == 'TRUE' for v in turn_vals):
+                        task_success_count[metric] += 1
 
         task_success_rate = {
             key: round(count / total_task_count, 4)*100

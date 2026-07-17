@@ -11,9 +11,12 @@ result/*
 deepeval_custom_metrics.md
 test.py
 auth_state.json
+business_platform_auth_state.json
 __MACOSX/
 raw_konwledge/*
 !raw_konwledge/.gitkeep
 log/*
 !log/.gitkeep
 __pycache__/main.cpython-312.pyc
+/data_qa
+数据流与隔离设计.md

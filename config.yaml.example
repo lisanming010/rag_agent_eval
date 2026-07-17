@@ -1,12 +1,26 @@
 # agent配置
 agents:
   # 使用何种形式接入agent
-  type: http 
+  type: http
   http_agent:
-    endpoint: https://xxxx
-    mode: FAST
     # 最高调用并发
     call_agent_th_max: 8
+    # 提交间隔（秒），控制提交频率避免服务端响应超时
+    submit_delay: 2
+    # Agent调用失败重试次数（不含首次调用）
+    call_agent_max_retries: 3
+    # 重试间隔（秒）
+    call_agent_retry_delay: 2
+    # 每个类的独立配置
+    class_config:
+      PVAssistant:
+        enabled: true
+        endpoint: https://xxxx
+        business_token: test
+      Diagnosis:
+        enabled: false
+        endpoint: ""
+        business_token: ""
 
 # 评价模型配置
 judge_llm:
@@ -28,8 +42,12 @@ metric_conf:
     threshold: 0.8
     topk: 5
   precision_k:
-    threshold: 0.6 
+    threshold: 0.6
     topk: 5
+  # 需要通过多模型复核的指标（仅 LLM 类指标需要复核，纯代码断言无需）
+  needs_review:
+    - reverse_validation
+    - contextual_recall
 
 # 评价器配置
 evluate:
@@ -71,6 +89,12 @@ dataset:
     multiturn:
       - reverse_validation
       - contextual_recall
+
+# 业务平台登录配置
+business_platform:
+  login_url: "https://pmms01-test.rundoai.com/api/system/login"
+  username: "your_username"
+  password: "your_password"
 
 result:
   save_path: result/

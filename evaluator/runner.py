@@ -13,18 +13,25 @@ from evaluator.metrics import (
     mrr_metric,
     recallk_metric,
     precisionk_metric,
+    dataqa_capability_metric,
+    dataqa_params_metric,
     create_metrics_for_model,
 )
 
 logger = LogFactory.get_logger(__name__)
 
-#指标注册表 
+_conf = ConfigReader.get_instance()
+METRIC_NEEDS_REVIEW: set[str] = set(_conf.get('metric_conf.needs_review', []))
+
+#指标注册表
 METRICS_MAP = {
     'reverse_validation': reverse_validation_metric,
     'contextual_recall': contextual_recall_metric,
     'mrr': mrr_metric,
     'recallk': recallk_metric,
     'precisionk': precisionk_metric,
+    'dataqa_capability': dataqa_capability_metric,
+    'dataqa_params': dataqa_params_metric,
 }
 
 
@@ -161,7 +168,7 @@ def run_evaluate(test_case: dict):
         if retry_verbose:
             logger.error(f"[失败] query='{case['query'][:60]}' 经{eval_max_retries}轮重试仍失败")
 
-    # 结果回写 
+    # 结果回写
     for case_dict in test_case_csv:
         query = case_dict['query']
         test_result = result_map.get(query)
@@ -169,9 +176,11 @@ def run_evaluate(test_case: dict):
             # 已在上面标记过 evaluate_error，这里仅补充 is_success 兜底
             if 'is_success' not in case_dict:
                 case_dict['is_success'] = False
+                case_dict['用例是否通过'] = False
             continue
 
         case_dict['is_success'] = test_result.success
+        case_dict['用例是否通过'] = test_result.success
         for md in test_result.metrics_data:
             metrics_name = md.name
             case_dict[f'{metrics_name}_is_success'] = md.success
@@ -198,8 +207,8 @@ def run_multimodel_reevaluate(test_case: dict):
     test_case_csv = test_case['csv']
     all_metrics = test_case['metrics']
 
-    # 筛选出 LLM 类指标（只有这些需要多模型复核）
-    llm_metrics = [m for m in all_metrics if m in ('reverse_validation', 'contextual_recall')]
+    # 筛选出需要多模型复核的指标（由 config 中 metric_conf.needs_review 控制）
+    llm_metrics = [m for m in all_metrics if m in METRIC_NEEDS_REVIEW]
     logger.debug(f'需复核的数据集：\n{llm_metrics}\n')
     if not llm_metrics:
         return
@@ -348,3 +357,73 @@ def _apply_voting(case: dict):
                 all_success = False
                 break
     case['is_success'] = all_success
+    # 反向归一化：is_success → 用例是否通过
+    case['用例是否通过'] = all_success
+
+
+def run_evaluate_structured(test_case: dict):
+    """执行 DataQA 结构化断言（capability_id + parameters）。
+
+    仅写入 per-metric 字段，不修改 is_success。
+    """
+    configured = test_case['metrics']
+
+    if 'dataqa_capability' in configured:
+        _eval_single_structured_metric(
+            test_case['csv'], dataqa_capability_metric, 'llm_test_case_capability'
+        )
+
+    if 'dataqa_params' in configured:
+        _eval_single_structured_metric(
+            test_case['csv'], dataqa_params_metric, 'llm_test_case_params'
+        )
+
+
+def _eval_single_structured_metric(csv_rows: list[dict], metric, tc_key: str):
+    """对单个结构化 metric 执行 evaluate 并回写 per-metric 字段。"""
+    valid_cases = [c for c in csv_rows if tc_key in c]
+    if not valid_cases:
+        logger.debug(f"[结构化] {metric.__name__}: 无有效用例（缺少 {tc_key}），跳过")
+        return
+
+    try:
+        result = evaluate(
+            [c[tc_key] for c in valid_cases],
+            [metric],
+            error_config=ErrorConfig(ignore_errors=True),
+        )
+    except Exception as e:
+        logger.error(f"[结构化] {metric.__name__} evaluate 异常: {e}")
+        return
+
+    result_map = {tr.input: tr for tr in result.test_results}
+
+    for case in csv_rows:
+        tr = result_map.get(case['query'])
+        if tr is None:
+            continue
+        for md in tr.metrics_data:
+            case[f'{md.name}_score'] = md.score
+            case[f'{md.name}_is_success'] = md.success
+            case[f'{md.name}_reason'] = md.reason
+            case[f'{md.name}_threshold'] = md.threshold
+
+    ok = sum(1 for c in valid_cases
+             if result_map.get(c['query']) and result_map[c['query']].success)
+    logger.info(f"[结构化] {metric.__name__}: {ok}/{len(valid_cases)} 通过")
+
+
+def recompute_overall_success(test_case: dict):
+    """基于所有 *_is_success 字段（排除 _model）取 AND，重算 is_success。"""
+    for case in test_case['csv']:
+        metric_keys = [
+            k for k in case
+            if k.endswith('_is_success')
+            and k != 'is_success'
+            and '_model' not in k
+        ]
+        if not metric_keys:
+            continue
+        all_pass = all(case[k] in (True, 'True') for k in metric_keys)
+        case['is_success'] = all_pass
+        case['用例是否通过'] = all_pass
