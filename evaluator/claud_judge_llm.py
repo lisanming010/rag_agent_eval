@@ -56,6 +56,7 @@ class ClaudJudgeLLM:
         if model_name not in self._openai_models:
             configreader = ConfigReader.get_instance()
             model_temperature = configreader.get("judge_llm.anthropic.temperature")
+            model_max_token = configreader.get("judge_llm.anthropic.max_token")
 
             self._openai_models[model_name] = GPTModel(
                 model=model_name,
@@ -63,7 +64,9 @@ class ClaudJudgeLLM:
                 api_key=self.auth_token,
                 temperature=model_temperature,
                 generation_kwargs={
-                    "response_format": {"type": "json_object"}
+                    "response_format": {"type": "json_object"},
+                    "max_tokens": model_max_token,
+                    "extra_body": {"enable_thinking": False}
                 }
             )
         return self._openai_models[model_name]
@@ -107,7 +110,8 @@ if __name__ == "__main__":
         retrieval_context=[ac_output]
     )
 
-    claude_judge = ClaudJudgeLLM().get_model('ZhipuAI/GLM-4.7-Flash')
+    # claude_judge = ClaudJudgeLLM().get_model('ZhipuAI/GLM-5.2')
+    claude_judge = ClaudJudgeLLM().get_model_openai('ZhipuAI/GLM-5.2')
     metric = ContextualRecallMetric(model=claude_judge, threshold=0.7)
     # metric = claude_judge.create_contextual_recall_metric(threshold=0.7)
     evaluate([test_case], [metric])

@@ -1,10 +1,17 @@
 import requests
 import json
+import os
 import time
 import uuid
 from functools import wraps
+from typing import Optional
+
+from dotenv import load_dotenv
+
+from tool.config_reader import ConfigReader
 from tool.log_factory import LogFactory
 
+load_dotenv()
 logger = LogFactory.get_logger(__name__)
 
 
@@ -31,13 +38,15 @@ class PVAssistant:
             "X-System-Code": "agent-workbench",
             "X-Business-Token": str(business_token),
             "X-Platform": "web",
-            "X-Tenant-Id": "146085512914162117",
+            # "X-Tenant-Id": "146085512914162117",
+            "X-Tenant-Id": "1",
             "Content-Type": "application/json"
         }
 
     @_timing
-    def call_agent(self, question:str, user:str="lisanming-auto-test", 
-                   session_id:str=None, res_mode:str='blocking', **kwargs)->list:
+    def call_agent(self, question:str, user:str="lisanming-auto-test",
+                   session_id:str=None, res_mode:str='blocking',
+                   tenant_id:str=None, **kwargs)->list:
         """
         agent调用接口,返回agent的回答
 
@@ -47,6 +56,7 @@ class PVAssistant:
         :param session_id: 会话ID，用于维护上下文。
                           并发调用时必须传入唯一值以避免后端混淆响应；
                           默认自动生成 UUID。
+        :param tenant_id: 租户ID，传入时覆盖 _base_header 中的 X-Tenant-Id
         :param kwargs: 其他参数，为后续扩展预留
         :return: agent的回答,json解析后的字典
         """
@@ -64,6 +74,8 @@ class PVAssistant:
 
         # 每次请求复制 header，避免并发下的竞态条件
         headers = dict(self._base_header)
+        if tenant_id is not None:
+            headers['X-Tenant-Id'] = tenant_id
         headers['X-Session-Id'] = session_id
         response = requests.post(self.base_url, data=payload, headers=headers)
         if response.status_code != 200:
@@ -353,6 +365,264 @@ class DataQA:
             return ""
         except Exception:
             return ""
+
+
+class RAGFlowRetriever:
+    """
+    RAGFlow 知识库检索器，通过 REST API 从指定知识库中检索相关 chunks。
+
+    配置来源（config.yaml 中 agents.http_agent.ragflow 段）：
+      - api_url: RAGFlow API 地址
+      - dataset_id: 默认数据集 ID
+      - top_k / similarity_threshold / vector_similarity_weight: 检索参数
+      - api_key: 从 .env 的 RAGFLOW_API_KEY 环境变量读取
+
+    使用示例::
+
+        retriever = RAGFlowRetriever()
+        result = retriever.retrieve(question="什么是RAGFlow?")
+        for chunk in result["chunks"]:
+            print(chunk["content"], chunk["similarity"])
+    """
+
+    def __init__(
+        self,
+        api_url: str | None = None,
+        api_key: str | None = None,
+        dataset_id: str | None = None,
+        top_k: int | None = None,
+        similarity_threshold: float | None = None,
+        vector_similarity_weight: float | None = None,
+    ):
+        """
+        :param api_url: RAGFlow API 地址，默认从 config 读取
+        :param api_key: RAGFlow API Key，默认从环境变量 RAGFLOW_API_KEY 读取
+        :param dataset_id: 默认数据集 ID，默认从 config 读取
+        :param top_k: 向量余弦计算涉及的 chunk 数量，默认 1024
+        :param similarity_threshold: 最小相似度阈值，默认 0.5
+        :param vector_similarity_weight: 向量余弦相似度权重，默认 0.7
+        """
+        conf = ConfigReader.get_instance()
+        ragflow_conf = conf.get("agents.http_agent.ragflow", {})
+
+        self.api_url = (
+            api_url
+            or ragflow_conf.get("api_url", "http://192.168.100.225")
+        ).rstrip("/")
+
+        self.api_key = api_key or os.getenv("RAGFLOW_API_KEY", "")
+
+        self.dataset_id = (
+            dataset_id if dataset_id is not None
+            else ragflow_conf.get("dataset_id", "")
+        )
+
+        self.top_k = (
+            top_k if top_k is not None
+            else ragflow_conf.get("top_k", 1024)
+        )
+        self.similarity_threshold = (
+            similarity_threshold if similarity_threshold is not None
+            else ragflow_conf.get("similarity_threshold", 0.5)
+        )
+        self.vector_similarity_weight = (
+            vector_similarity_weight if vector_similarity_weight is not None
+            else ragflow_conf.get("vector_similarity_weight", 0.7)
+        )
+
+        self._retrieval_url = f"{self.api_url}/api/v1/retrieval"
+
+    # ------------------------------------------------------------------
+    # 核心检索方法
+    # ------------------------------------------------------------------
+
+    @_timing
+    def retrieve(
+        self,
+        question: str,
+        dataset_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        page: int = 1,
+        page_size: int = 30,
+        top_k: int | None = None,
+        similarity_threshold: float | None = None,
+        vector_similarity_weight: float | None = None,
+        keyword: bool = False,
+        highlight: bool = False,
+        use_kg: bool = False,
+        toc_enhance: bool = False,
+        **kwargs,
+    ) -> tuple[dict, list[dict]]:
+        """
+        调用 RAGFlow 检索接口，返回原始响应与 chunk 列表。
+
+        若未传入 dataset_ids 且未传入 document_ids，自动使用实例的 dataset_id。
+
+        :param question: 查询问题 / 关键词
+        :param dataset_ids: 数据集 ID 列表，不传则使用实例默认 dataset_id
+        :param document_ids: 文档 ID 列表，与 dataset_ids 二选一
+        :param page: 分页页码，默认 1
+        :param page_size: 每页最大 chunk 数，默认 30
+        :param top_k: 覆盖实例级别的 top_k
+        :param similarity_threshold: 覆盖实例级别的 similarity_threshold
+        :param vector_similarity_weight: 覆盖实例级别的 vector_similarity_weight
+        :param keyword: 是否启用关键词匹配
+        :param highlight: 是否高亮匹配词
+        :param use_kg: 是否使用知识图谱进行多跳查询
+        :param toc_enhance: 是否使用目录增强检索
+        :param kwargs: 其他可选参数，传递到请求 body
+        :return: (response_raw, chunks)
+        :raises RuntimeError: API 调用失败或响应解析失败时抛出
+        """
+        if not self.api_key:
+            raise RuntimeError(
+                "RAGFLOW_API_KEY 未配置，请在 .env 文件中设置 RAGFLOW_API_KEY"
+            )
+
+        # 未传 dataset_ids / document_ids 时回退到实例默认 dataset_id
+        resolved_dataset_ids = dataset_ids
+        if not resolved_dataset_ids and not document_ids and self.dataset_id:
+            resolved_dataset_ids = [self.dataset_id]
+
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+
+        body: dict = {
+            "question": question,
+            "page": page,
+            "page_size": page_size,
+            "similarity_threshold": (
+                similarity_threshold if similarity_threshold is not None
+                else self.similarity_threshold
+            ),
+            "vector_similarity_weight": (
+                vector_similarity_weight if vector_similarity_weight is not None
+                else self.vector_similarity_weight
+            ),
+            "top_k": top_k if top_k is not None else self.top_k,
+            "keyword": keyword,
+            "highlight": highlight,
+            "use_kg": use_kg,
+            "toc_enhance": toc_enhance,
+        }
+
+        if resolved_dataset_ids:
+            body["dataset_ids"] = resolved_dataset_ids
+        if document_ids:
+            body["document_ids"] = document_ids
+
+        body.update(kwargs)
+
+        logger.info(
+            f"RAGFlow 检索请求: question={question[:80]}..., "
+            f"dataset_ids={resolved_dataset_ids}, top_k={body['top_k']}"
+        )
+
+        response = requests.post(
+            self._retrieval_url,
+            data=json.dumps(body, ensure_ascii=False),
+            headers=headers,
+        )
+
+        if response.status_code != 200:
+            logger.error(
+                f"RAGFlow 检索失败，状态码: {response.status_code}, "
+                f"响应内容: {response.text}"
+            )
+            raise RuntimeError(
+                f"RAGFlow 检索失败，状态码: {response.status_code}, "
+                f"响应内容: {response.text}"
+            )
+
+        try:
+            response_raw = response.json()
+        except json.JSONDecodeError:
+            logger.error(f"RAGFlow 响应不是有效的 JSON: {response.text}")
+            raise RuntimeError(f"RAGFlow 响应不是有效的 JSON: {response.text}")
+
+        if response_raw.get("code") != 0:
+            error_msg = response_raw.get("message", "未知错误")
+            logger.error(
+                f"RAGFlow API 返回错误码: {response_raw.get('code')}, "
+                f"消息: {error_msg}"
+            )
+            raise RuntimeError(f"RAGFlow API 错误: {error_msg}")
+
+        chunks = (response_raw.get("data") or {}).get("chunks", [])
+
+        return response_raw, chunks
+
+    # ------------------------------------------------------------------
+    # 便捷方法
+    # ------------------------------------------------------------------
+
+    def retrieve_contents(
+        self,
+        question: str,
+        dataset_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        min_similarity: float = 0.0,
+        **kwargs,
+    ) -> list[str]:
+        """
+        便捷方法：检索并返回 chunk 文本内容列表。
+
+        :param question: 查询问题
+        :param dataset_ids: 数据集 ID 列表
+        :param document_ids: 文档 ID 列表
+        :param min_similarity: 最低相似度过滤阈值，默认 0.0 不过滤
+        :param kwargs: 传递到 retrieve() 的其他参数
+        :return: chunk 文本内容列表
+        """
+        _, chunks = self.retrieve(
+            question=question,
+            dataset_ids=dataset_ids,
+            document_ids=document_ids,
+            **kwargs,
+        )
+        return [
+            c["content"]
+            for c in chunks
+            if c.get("similarity", 0) >= min_similarity
+        ]
+
+    def retrieve_with_scores(
+        self,
+        question: str,
+        dataset_ids: list[str] | None = None,
+        document_ids: list[str] | None = None,
+        **kwargs,
+    ) -> list[dict]:
+        """
+        便捷方法：检索并返回带相似度分数的 chunk 摘要列表。
+
+        :param question: 查询问题
+        :param dataset_ids: 数据集 ID 列表
+        :param document_ids: 文档 ID 列表
+        :param kwargs: 传递到 retrieve() 的其他参数
+        :return: [{content, similarity, vector_similarity, term_similarity,
+                   document_name, document_id, chunk_id}, ...]
+        """
+        _, chunks = self.retrieve(
+            question=question,
+            dataset_ids=dataset_ids,
+            document_ids=document_ids,
+            **kwargs,
+        )
+        return [
+            {
+                "content": c.get("content", ""),
+                "similarity": c.get("similarity"),
+                "vector_similarity": c.get("vector_similarity"),
+                "term_similarity": c.get("term_similarity"),
+                "document_name": c.get("document_keyword", ""),
+                "document_id": c.get("document_id", ""),
+                "chunk_id": c.get("id", ""),
+            }
+            for c in chunks
+        ]
 
 
 if __name__ == "__main__":

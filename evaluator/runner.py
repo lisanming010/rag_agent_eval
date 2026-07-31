@@ -123,14 +123,17 @@ def run_evaluate(test_case: dict):
     ]
 
     # 重试循环
+    initial_pending = len(pending)
     retry_round = 0
     while pending and retry_round < eval_max_retries:
         retry_round += 1
         delay = min(retry_backoff_base ** retry_round, retry_max_backoff)
 
+        completed = initial_pending - len(pending)
         if retry_verbose:
             logger.info(f"[重试] 第 {retry_round}/{eval_max_retries} 轮，"
-                        f"待重试用例: {len(pending)} 条，等待 {delay:.1f}s")
+                        f"已完成 {completed}/{initial_pending}，"
+                        f"待重试 {len(pending)} 条，等待 {delay:.1f}s")
 
         time.sleep(delay)
 
@@ -148,12 +151,12 @@ def run_evaluate(test_case: dict):
                     result_map[query] = retry_result.test_results[0]
                     case['retry_count'] = retry_round
                     if retry_verbose:
-                        logger.info(f"  ✓ [{idx+1}/{len(pending)}] "
+                        logger.info(f"  ✓ [{completed + idx + 1}/{initial_pending}] "
                                     f"query='{query[:50]}' 第{retry_round}轮重试成功")
                     continue
             except Exception as e:
                 if retry_verbose:
-                    logger.info(f"  ✗ [{idx+1}/{len(pending)}] "
+                    logger.info(f"  ✗ [{completed + idx + 1}/{initial_pending}] "
                                 f"query='{query[:50]}' 重试异常: {e}")
 
             still_pending.append(case)
@@ -290,12 +293,15 @@ def _batch_reevaluate(bad_cases: list[dict], metrics_map: dict, model_label: str
     ]
 
     # 重试循环
+    initial_pending = len(pending)
     retry_round = 0
     while pending and retry_round < eval_max_retries:
         retry_round += 1
         delay = min(retry_backoff_base ** retry_round, retry_max_backoff)
+        completed = initial_pending - len(pending)
         logger.info(f"[多模型复核] {model_label} 第 {retry_round}/{eval_max_retries} 轮重试，"
-                    f"待重试: {len(pending)} 条，等待 {delay:.1f}s")
+                    f"已完成 {completed}/{initial_pending}，"
+                    f"待重试 {len(pending)} 条，等待 {delay:.1f}s")
         time.sleep(delay)
 
         still_pending = []
@@ -304,11 +310,11 @@ def _batch_reevaluate(bad_cases: list[dict], metrics_map: dict, model_label: str
                 retry_result = _do_evaluate([case], ignore_errors=False)
                 if retry_result.test_results and not _score_missing(retry_result.test_results[0]):
                     result_map[case['query']] = retry_result.test_results[0]
-                    logger.info(f"  ✓ [{idx+1}/{len(pending)}] "
+                    logger.info(f"  ✓ [{completed + idx + 1}/{initial_pending}] "
                                 f"query='{case['query'][:50]}' {model_label}重试成功")
                     continue
             except Exception as e:
-                logger.info(f"  ✗ [{idx+1}/{len(pending)}] "
+                logger.info(f"  ✗ [{completed + idx + 1}/{initial_pending}] "
                             f"query='{case['query'][:50]}' {model_label}重试异常: {e}")
             still_pending.append(case)
 

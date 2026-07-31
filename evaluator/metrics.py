@@ -31,7 +31,8 @@ class CreateMetrics:
         """
         :param model_name: 可选指定评测模型名称，不传则使用配置文件默认 model
         """
-        self.model = ClaudJudgeLLM().get_model(model_name)
+        # self.model = ClaudJudgeLLM().get_model(model_name)
+        self.model = ClaudJudgeLLM().get_model_openai(model_name)
 
     def create_contextual_recall_metric(self, threshold=0.7) -> ContextualRecallMetric:
         """

@@ -172,7 +172,8 @@ def make_test_case_list(csv_path: str | None, metrics: list | None,
     return result
 
 
-def make_tmp_test_case_list(csv_path: str | None, metrics: list | None) -> dict[str, list[dict]]:
+def make_tmp_test_case_list(csv_path: str | None, metrics: list | None,
+                            agent_classes: list[str] | None = None) -> dict[str, list[dict]]:
     """
     从 tmp 中间文件构建测试用例列表，用于 --resume 重入评测。
     按 agent 类名分组返回，与 make_test_case_list 保持一致的 dict 结构。
@@ -216,11 +217,14 @@ def make_tmp_test_case_list(csv_path: str | None, metrics: list | None) -> dict[
             entry_path = os.path.join(default_path, entry)
             if not os.path.isdir(entry_path):
                 continue
+            # 子目录名映射为类名: diagnosis → Diagnosis
+            agent_class = _dir_to_class_name(entry)
+            # 若指定了 agent_classes，只加载匹配的类（忽略大小写）
+            if agent_classes and agent_class.lower() not in (a.lower() for a in agent_classes):
+                continue
             tmp_dir = Path(entry_path) / 'tmp'
             if not tmp_dir.is_dir():
                 continue
-            # 子目录名映射为类名: diagnosis → Diagnosis
-            agent_class = _dir_to_class_name(entry)
             for f in tmp_dir.glob('*_tmp.csv'):
                 meta = _read_meta_for_tmp(str(f))
                 tmp_files.append((str(f), meta, agent_class))

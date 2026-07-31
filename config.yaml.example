@@ -21,6 +21,19 @@ agents:
         enabled: false
         endpoint: ""
         business_token: ""
+      DataQA:
+        enabled: false
+        endpoint: ""
+        business_token: ""
+      RAGFlowRetriever:
+        enabled: false
+    # RAGFlow 知识库检索配置
+    ragflow:
+      api_url: http://192.168.100.225
+      dataset_id: ""
+      top_k: 1024
+      similarity_threshold: 0.5
+      vector_similarity_weight: 0.7
 
 # 评价模型配置
 judge_llm:

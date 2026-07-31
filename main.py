@@ -57,6 +57,28 @@ def parse_args():
     return parser.parse_args()
 
 
+def _resolve_tenant_id(source_csv: str) -> str | None:
+    """从测试用例源文件路径提取后缀，查找对应的 X-Tenant-Id。
+
+    文件命名规范: test_cases_<suffix>.csv
+    例如 test_cases_normal.csv → suffix=normal → 查 tenant_id_map
+
+    :param source_csv: 测试用例 CSV 文件路径（即 _source_csv 字段值）
+    :return: 匹配到的 tenant_id 字符串，未匹配返回 None
+    """
+    if not source_csv:
+        return None
+    filename = os.path.basename(source_csv)
+    if not (filename.startswith('test_cases_') and filename.endswith('.csv')):
+        return None
+    suffix = filename[len('test_cases_'):-len('.csv')]
+    conf = ConfigReader.get_instance()
+    tenant_map = conf.get('agents.http_agent.class_config.PVAssistant.tenant_id_map', {})
+    if suffix in tenant_map:
+        return tenant_map[suffix]
+    return tenant_map.get('default', None)
+
+
 #Agent 调用薄函数
 def call_agent(agent, test_case_csv: dict):
     """agent调用入口，内置重试逻辑，成功时将响应并入字典"""
@@ -67,9 +89,13 @@ def call_agent(agent, test_case_csv: dict):
     query = test_case_csv.get('query', '')
     logger.info(f'call_agent, query: {query[:80]}')
 
+    tenant_id = _resolve_tenant_id(test_case_csv.get('_source_csv', ''))
+
     for attempt in range(max_retries + 1):
         try:
-            answer_raw, answer_summary, res_time = agent.call_agent(query)
+            answer_raw, answer_summary, res_time = agent.call_agent(
+                query, tenant_id=tenant_id
+            )
             test_case_csv['agent_response'] = answer_summary
             test_case_csv['res_time(s)'] = res_time
             logger.debug(answer_raw)
@@ -242,6 +268,7 @@ def call_multi_turn_agent(agent, case_row: dict) -> list[dict]:
 
     parent_case_id = case_row.get('用例编号', session_id)
     source_csv = case_row.get('_source_csv', '')
+    tenant_id = _resolve_tenant_id(source_csv)
     logger.info(f'[多轮] 开始, 用例编号={parent_case_id}, 共{len(turns)}轮, session_id={session_id}')
 
     sub_rows = []
@@ -253,7 +280,7 @@ def call_multi_turn_agent(agent, case_row: dict) -> list[dict]:
         for attempt in range(max_retries + 1):
             try:
                 answer_raw, answer_summary, res_time = agent.call_agent(
-                    question, session_id=session_id
+                    question, session_id=session_id, tenant_id=tenant_id
                 )
                 break
             except Exception as e:
@@ -662,7 +689,7 @@ class EvaluationPipeline:
 
     # resume: 从 tmp 目录加载中间文件
     def _prepare_from_tmp(self) -> dict[str, list[dict]]:
-        return make_tmp_test_case_list(self.csv_path, self.metrics)
+        return make_tmp_test_case_list(self.csv_path, self.metrics, self.agent_classes)
 
     # resume: 跳过 call_agent，仅执行 llm_test_case 组装
     def _invoke_agents_resume(self, test_cases_by_class: dict[str, list[dict]]):
