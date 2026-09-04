@@ -6,11 +6,12 @@ from deepeval.models import AnthropicModel, GPTModel
 from deepeval.metrics import AnswerRelevancyMetric, ContextualRecallMetric
 from dotenv import load_dotenv
 from tool.config_reader import ConfigReader
-from evaluator.deepeval_patch import patch_anthropic_model
+from evaluator.deepeval_patch import patch_anthropic_model, patch_evaluation_progress
 import os
 
 load_dotenv()
 patch_anthropic_model()
+patch_evaluation_progress()
 
 class ClaudJudgeLLM:
     """实例化基于claude模型，支持多模型实例缓存（按 model_name 隔离）"""
@@ -86,32 +87,55 @@ if __name__ == "__main__":
     from deepeval import evaluate
 
     ac_output = """
-        光伏电站按是否与公共电网连接，可分为**独立光伏电站（离网系统）**、**并网光伏电站**以及**混合型光伏电站（并离网互补）**。具体如下：
+Current Diagnostic Target: Inverter Type -> Manufacturer (Sungrow) -> Sungrow General Model -> Fault Code -> MPPT 1 reverse connection
 
-        | 类型 | 定义 | 特点 |
-        |------|------|------|
-        | **独立光伏电站（离网系统）** | 不接入公共电网，自成发电-储能-用电闭环。 | 必须配备蓄电池储能，用于夜间或阴雨天供电。适用于无电网覆盖的偏远地区（如海岛、山区、边防哨所）。典型容量较小（几百瓦~几十千瓦），组件阵列与蓄电池组通过控制器充放电，逆变器仅需输出稳定交流电（正弦波或修正波）。 |
-        | **并网光伏电站** | 直接接入公共电网，所发电力优先自用或全额上网。 | 可分“全额上网”和“自发自用、余电上网”两种消纳模式。不需要储能（但部分可配储能以参与调峰）。容量范围宽（从户用几千瓦到大型地面数百兆瓦）。投资成本较低，系统简单，是目前主流形式。 |
-        | **混合型光伏电站（并离网互补）** | 同时具备并网和接入蓄电池的功能，支持并网模式，也可在电网停电时切换为离网独立供电。 | 采用双向逆变器（又称储能逆变器或混合逆变器），电池充放电可灵活调度。适用于对供电可靠性要求较高的用户（如医院、数据中心、有应急备电需求的工厂）。成本介于离网和纯并网之间，在配电网薄弱地区增多。 |
+---
 
-        > **运维提醒**：  
-        > - 并网电站检修前，必须断开并网开关，确认电网侧已停电（可通过验电器判断），并严格按照“停电、验电、挂地线、挂牌”流程操作。  
-        > - 独立电站的蓄电池区域需保持通风、干燥，防止氢气积聚（铅酸电池充电时可能析出氢气和氧气），避免明火和电气火花。  
-        > - 混合型电站的储能逆变器在进行离网切换测试时，应确保负载侧已断开非重要负荷，防止瞬间过载损坏逆变器。
+### **Fault Name: MPPT 1 reverse connection**
+**Fault Code:** `264`
 
-        ---
-        >**来源**：大模型通用知识
+**Fault Code 264 - MPPT 1 Reverse Connection**
+
+**Possible Cause:**
+The PV string connected to the MPPT 1 channel has been wired with reversed DC polarity.
+
+**Action Steps:**
+1. **Automatic Recovery:** This fault is **non-auto-recoverable**. It requires manual inspection, a complete power shutdown, and a physical reset of the wiring.
+2. **Test DC Polarity:** Use a multimeter to verify the DC voltage polarity at the MPPT 1 input terminals.
+3. **Safety Protocol:** Wait until the string current drops below 5A before opening the DC switch to correct the wiring polarity.
+4. **Correct Wiring:** Open the DC switch, correct the reversed polarity, and then close the DC switch.
+5. **Verify:** Confirm that the MPPT 1 reverse connection alarm has cleared from the inverter display.
+
+---
+
+**Guidance:**
+This procedure is specific to the MPPT 1 input channel. If the fault code persists after correcting the polarity and resetting the system, the issue may be internal to the inverter's MPPT circuitry rather than the external PV wiring. To proceed, please confirm whether the DC voltage at the MPPT 1 terminals reads a positive value (e.g., +400V) or a negative value (e.g., -400V) relative to ground, as this will determine if the wiring correction was successful or if further hardware diagnostics are needed.
+
+---
+Hope this helps. You can now:
+<suggest>learn more</suggest>
+<suggest>save to case base</suggest>
     """
 
     test_case = LLMTestCase(
         input="用户问下单量应该查什么字段？",
-        expected_output="应回答两类：（1）离网光伏电站；（2）并网光伏电站。",
+        expected_output="""
+Device Type (Inverter) → Manufacturer (Sungrow) → Model (General) → Fault Code → MPPT 1 reverse connection,Possible Cause:
+PV string connected to MPPT1 channel wired with reversed DC polarity.
+
+Action:
+1. **Automatic Recovery**: **【Non-auto-recoverable】** (Requires manual inspection, power shutdown, and physical reset);
+2. **Test dc**: Test DC voltage polarity at MPPT1 input terminals using a multimete;
+3. **Safety Protocol**: **Wait until string current drops below;
+4. **5a before**: 5A before opening DC switch to correct wiring polarity**;
+5. **Close dc**: Close DC switch and verify MPPT1 reverse connection alarm clears;
+""",
         context=[],
         retrieval_context=[ac_output]
     )
 
     # claude_judge = ClaudJudgeLLM().get_model('ZhipuAI/GLM-5.2')
-    claude_judge = ClaudJudgeLLM().get_model_openai('ZhipuAI/GLM-5.2')
+    claude_judge = ClaudJudgeLLM().get_model_openai('Qwen/Qwen3.6-27B')
     metric = ContextualRecallMetric(model=claude_judge, threshold=0.7)
     # metric = claude_judge.create_contextual_recall_metric(threshold=0.7)
     evaluate([test_case], [metric])

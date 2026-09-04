@@ -11,6 +11,7 @@ from .business_platform_token_manager import (
     PlatformTokenState,
     ensure_valid_token,
 )
+from .business_platform_client import BusinessPlatformClient
 
 __all__ = [
     "ConfigReader",
@@ -23,4 +24,5 @@ __all__ = [
     "BusinessPlatformTokenManager",
     "PlatformTokenState",
     "ensure_valid_token",
+    "BusinessPlatformClient",
 ]

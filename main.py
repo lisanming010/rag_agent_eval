@@ -11,20 +11,25 @@ from pathlib import Path
 from deepeval.test_case import LLMTestCase
 
 from tool.config_reader import ConfigReader
-from tool.concurrency import run_in_thread_pool
+from tool.concurrency import ProgressEvent, emit_terminal_progress, run_in_thread_pool
 from tool.csv_writer import CsvWriter
 from tool.file_utils import mkdir_with_timestamp
 from tool import AsyncResultWriter, MarkdownWriter
 from tool.collection_result import CollectionResult
 from tool.get_bad_cases import extract_bad_cases
 from tool.log_factory import LogFactory
-from agents.factory import create_agent, get_enabled_classes
+from agents.factory import create_agent, get_enabled_classes, is_agent_only_enabled
 from pipeline.test_case_loader import make_test_case_list, make_tmp_test_case_list
+from pipeline.resume import prepare_resume
+from pipeline.placeholder_filler import fill_test_cases, fill_raw_datasets, preview_fill
 from evaluator.runner import run_evaluate, run_evaluate_structured, run_multimodel_reevaluate, recompute_overall_success
 
 logger = LogFactory.get_logger(__name__)
 
-#CLI 
+# 检索类指标名称集合 — 用例 metrics 中包含任一即触发 RAGFlow 检索轨
+RETRIEVAL_METRIC_NAMES = {'mrr', 'recallk', 'precisionk'}
+
+#CLI
 def parse_args():
     """解析命令行参数"""
     parser = argparse.ArgumentParser(description="执行评测套件")
@@ -50,11 +55,37 @@ def parse_args():
         help='从tmp目录恢复评测，跳过Agent调用阶段，直接从组装llm_test_case处重入'
     )
     parser.add_argument(
+        '--resume-result-dir',
+        help='可选的历史 result/<时间戳> 目录；指定则校验 checkpoint 并复用通过结果，'
+             '不指定则从 tmp 全量重新评价',
+    )
+    parser.add_argument(
         '-a', '--agent_classes',
         nargs='+',
         help='指定调用的 agent 类名，支持多个，如: -a Diagnosis 或 -a PVAssistant Diagnosis'
     )
-    return parser.parse_args()
+    parser.add_argument(
+        '--seed',
+        type=int,
+        default=None,
+        help='占位符填充随机种子，不传则随机生成（生成的 seed 会输出到日志和评测报告）'
+    )
+    parser.add_argument(
+        '--fill-preview',
+        action='store_true',
+        help='仅执行占位符填充预览，输出到 placeholder_fill.output_dir 后退出，不执行评测'
+    )
+    parser.add_argument(
+        '--refresh-entities',
+        action='store_true',
+        help='填充前先调用业务平台接口更新 entity_mapping.json（登录/接口失败时中断执行）'
+    )
+    args = parser.parse_args()
+    if args.resume_result_dir is not None and not args.resume:
+        parser.error('--resume-result-dir 必须与 --resume 一起使用')
+    if args.resume and args.fill_preview:
+        parser.error('--resume 不能与 --fill-preview 一起使用')
+    return args
 
 
 def _resolve_tenant_id(source_csv: str) -> str | None:
@@ -79,6 +110,31 @@ def _resolve_tenant_id(source_csv: str) -> str | None:
     return tenant_map.get('default', None)
 
 
+def _case_progress_label(test_case: dict) -> str:
+    """提取适合终端展示的短用例标识。"""
+    for key in ('用例编号', 'case_id', 'id', 'query'):
+        value = test_case.get(key)
+        if value is not None and str(value).strip():
+            return ' '.join(str(value).split())[:80]
+    return '?'
+
+
+def _emit_retry_progress(task_name: str, test_case: dict, attempt: int,
+                         max_retries: int, retry_delay: float, error: Exception,
+                         context: str = '') -> None:
+    """输出独立于 logging 配置的 Agent 重试事件。"""
+    context_text = f' {context}' if context else ''
+    emit_terminal_progress(ProgressEvent(
+        event='retry',
+        task_name=task_name,
+        message=(
+            f'用例={_case_progress_label(test_case)}{context_text} '
+            f'尝试={attempt + 2}/{max_retries + 1} '
+            f'原因={type(error).__name__}: {error} 等待={retry_delay}s'
+        ),
+    ))
+
+
 #Agent 调用薄函数
 def call_agent(agent, test_case_csv: dict):
     """agent调用入口，内置重试逻辑，成功时将响应并入字典"""
@@ -89,13 +145,15 @@ def call_agent(agent, test_case_csv: dict):
     query = test_case_csv.get('query', '')
     logger.info(f'call_agent, query: {query[:80]}')
 
-    tenant_id = _resolve_tenant_id(test_case_csv.get('_source_csv', ''))
+    tenant_id = test_case_csv.get('_tenant_id')
+    language = test_case_csv.get('language')
+    request_kwargs = {'tenant_id': tenant_id}
+    if language is not None and str(language).strip():
+        request_kwargs['language'] = str(language).strip()
 
     for attempt in range(max_retries + 1):
         try:
-            answer_raw, answer_summary, res_time = agent.call_agent(
-                query, tenant_id=tenant_id
-            )
+            answer_raw, answer_summary, res_time = agent.call_agent(query, **request_kwargs)
             test_case_csv['agent_response'] = answer_summary
             test_case_csv['res_time(s)'] = res_time
             logger.debug(answer_raw)
@@ -107,12 +165,17 @@ def call_agent(agent, test_case_csv: dict):
                     f'call_agent失败，第{attempt + 1}/{max_retries}次重试, '
                     f'query: {query[:80]}, 错误: {e}'
                 )
+                _emit_retry_progress(
+                    'call_agent', test_case_csv, attempt,
+                    max_retries, retry_delay, e,
+                )
                 time.sleep(retry_delay)
             else:
                 logger.error(
                     f'call_agent最终失败（已重试{max_retries}次）, '
                     f'query: {query[:80]}, 错误: {e}'
                 )
+                raise
 
 
 def _call_agent_dataqa_direct(agent, test_case_csv: dict):
@@ -121,6 +184,12 @@ def _call_agent_dataqa_direct(agent, test_case_csv: dict):
     max_retries = conf.get("agents.http_agent.call_agent_max_retries", 3)
     retry_delay = conf.get("agents.http_agent.call_agent_retry_delay", 2)
 
+    # 数据集列的 actual_capability_id 是预期值（如 station_overview），
+    # 稍后会被覆盖为 agent 实际返回值，先保存到 expected_capability_id 供断言使用。
+    # 仅首次保存：--resume 重入时 tmp 文件已含该列，避免把上一轮的实际值误当预期
+    if 'expected_capability_id' not in test_case_csv:
+        test_case_csv['expected_capability_id'] = test_case_csv.get('actual_capability_id', '')
+
     query = test_case_csv.get('query', '')
     logger.info(f'DataQA direct_inquiry, query: {query[:80]}')
 
@@ -128,6 +197,26 @@ def _call_agent_dataqa_direct(agent, test_case_csv: dict):
         try:
             start = time.perf_counter()
             new_query_raw, confirmation_id, session_id = agent.new_query(query)
+
+            # 第一步未提取到 confirmationId（如实体绑定失败）：
+            # 原始响应写入独立列并标记跳过后续断言，不执行 confirm_execute，也不重试
+            if confirmation_id is None:
+                test_case_csv['new_query_fail_raw'] = json.dumps(
+                    new_query_raw, ensure_ascii=False
+                )
+                test_case_csv['skip_assertion'] = True
+                test_case_csv['is_success'] = False
+                test_case_csv['用例是否通过'] = False
+                test_case_csv['evaluate_error'] = (
+                    '第一步未提取到confirmationId，跳过结构化断言'
+                    '（原始响应见 new_query_fail_raw 列）'
+                )
+                logger.warning(
+                    f'DataQA new_query 未提取到confirmationId, '
+                    f'query: {query[:80]}, 已标记跳过断言'
+                )
+                return
+
             test_case_csv['new_query_res_raw'] = json.dumps(
                 new_query_raw, ensure_ascii=False
             )
@@ -152,12 +241,34 @@ def _call_agent_dataqa_direct(agent, test_case_csv: dict):
                     f'DataQA direct_inquiry 失败，第{attempt + 1}/{max_retries}次重试, '
                     f'query: {query[:80]}, 错误: {e}'
                 )
+                _emit_retry_progress(
+                    'DataQA-direct', test_case_csv, attempt,
+                    max_retries, retry_delay, e,
+                )
                 time.sleep(retry_delay)
             else:
                 logger.error(
                     f'DataQA direct_inquiry 最终失败（已重试{max_retries}次）, '
                     f'query: {query[:80]}, 错误: {e}'
                 )
+                raise
+
+
+def call_ragflow_retrieve(retriever, test_case_csv: dict):
+    """调 RAGFlow 检索接口，将文档名列表（document_keyword）写回 case dict
+
+    RAGFlow 调用失败时不抛异常，标记错误让后续 make_llm_case_retrieval 跳过。
+    """
+    query = test_case_csv.get('query', '')
+    logger.info(f'RAGFlow检索, query: {query[:80]}')
+    try:
+        _, chunks, _ = retriever.retrieve(question=query)
+        test_case_csv['retrieved_docs'] = [
+            _normalize_whitespace(c.get('document_keyword', '')) for c in chunks
+        ]
+        logger.info(f'RAGFlow检索成功, query: {query[:80]}, 召回{len(chunks)}条')
+    except Exception as e:
+        logger.error(f'RAGFlow检索失败, query: {query[:80]}, 错误: {e}')
 
 
 def make_llm_case(test_case_csv: dict):
@@ -165,6 +276,13 @@ def make_llm_case(test_case_csv: dict):
 
     agent_response 缺失时（call_agent 失败）跳过该用例，写入错误标记。
     """
+    if _is_skip_assertion(test_case_csv):
+        logger.debug(
+            f"[跳过] query='{test_case_csv.get('query', '?')[:60]}' "
+            f"已标记 skip_assertion，不组装 LLMTestCase"
+        )
+        return
+
     if 'agent_response' not in test_case_csv:
         logger.debug(
             f"[跳过] query='{test_case_csv.get('query', '?')[:60]}' "
@@ -193,6 +311,13 @@ def make_llm_case_structured(test_case_csv: dict):
     actual_capability_id / actual_parameters 任一缺失时标记失败并跳过组装。
     """
     query = test_case_csv.get('query', '')
+
+    if _is_skip_assertion(test_case_csv):
+        logger.debug(
+            f"[跳过] query='{query[:60]}' 已标记 skip_assertion，跳过结构化断言"
+        )
+        return
+
     missing = []
 
     if 'actual_capability_id' not in test_case_csv:
@@ -222,11 +347,70 @@ def make_llm_case_structured(test_case_csv: dict):
     )
 
 
+def make_llm_case_retrieval(test_case_csv: dict):
+    """为检索评测组装 LLMTestCase
+
+    retrieval_context = 实际召回的文档名列表（document_keyword）
+    expected_output   = 预处理后的期望文档名（| 分隔），与 document_keyword 对齐
+
+    retrieved_docs 或 expected_docs 缺失时标记失败并跳过组装。
+    """
+    if 'retrieved_docs' not in test_case_csv:
+        logger.debug(
+            f"[跳过] query='{test_case_csv.get('query', '?')[:60]}' "
+            f"retrieved_docs 缺失，无法组装检索 LLMTestCase"
+        )
+        test_case_csv['is_success'] = False
+        test_case_csv['evaluate_error'] = 'RAGFlow检索失败，无retrieved_docs'
+        return
+
+    raw_expected = test_case_csv.get('expected_docs', '')
+    if not raw_expected:
+        logger.debug(
+            f"[跳过] query='{test_case_csv.get('query', '?')[:60]}' "
+            f"expected_docs 为空，无法执行检索评测"
+        )
+        test_case_csv['is_success'] = False
+        test_case_csv['evaluate_error'] = '缺少expected_docs列'
+        return
+
+    test_case_csv['llm_test_case_retrieval'] = LLMTestCase(
+        input=test_case_csv['query'],
+        expected_output=_normalize_expected_docs(raw_expected),
+        retrieval_context=test_case_csv['retrieved_docs'],
+    )
+
+
+def _normalize_whitespace(raw: str) -> str:
+    """去除字符串前后空白，并将内部多余空白（含换行）压缩为单个空格"""
+    if not raw:
+        return raw
+    return ' '.join(raw.split())
+
+
+def _normalize_expected_docs(raw: str) -> str:
+    """预处理 expected_docs：按 | 分隔后对每段做空白规范化，再以 | 拼回"""
+    if not raw:
+        return raw
+    return '|'.join(
+        _normalize_whitespace(doc) for doc in raw.split('|')
+        if _normalize_whitespace(doc)
+    )
+
+
 # ---- 多轮对话支持 ----
 
 def _is_multi_turn(case_row: dict) -> bool:
     """判断用例是否为多轮对话，兼容CSV字符串和Python bool"""
     val = case_row.get('is_multi_turn', False)
+    if isinstance(val, str):
+        return val.strip().upper() in ('TRUE', 'YES', '1')
+    return bool(val)
+
+
+def _is_skip_assertion(case_row: dict) -> bool:
+    """判断用例是否被标记跳过断言（第一步未提取到confirmationId），兼容CSV字符串和Python bool"""
+    val = case_row.get('skip_assertion', False)
     if isinstance(val, str):
         return val.strip().upper() in ('TRUE', 'YES', '1')
     return bool(val)
@@ -268,7 +452,14 @@ def call_multi_turn_agent(agent, case_row: dict) -> list[dict]:
 
     parent_case_id = case_row.get('用例编号', session_id)
     source_csv = case_row.get('_source_csv', '')
-    tenant_id = _resolve_tenant_id(source_csv)
+    tenant_id = case_row.get('_tenant_id')
+    language = case_row.get('language')
+    request_kwargs = {
+        'session_id': session_id,
+        'tenant_id': tenant_id,
+    }
+    if language is not None and str(language).strip():
+        request_kwargs['language'] = str(language).strip()
     logger.info(f'[多轮] 开始, 用例编号={parent_case_id}, 共{len(turns)}轮, session_id={session_id}')
 
     sub_rows = []
@@ -280,7 +471,7 @@ def call_multi_turn_agent(agent, case_row: dict) -> list[dict]:
         for attempt in range(max_retries + 1):
             try:
                 answer_raw, answer_summary, res_time = agent.call_agent(
-                    question, session_id=session_id, tenant_id=tenant_id
+                    question, **request_kwargs
                 )
                 break
             except Exception as e:
@@ -325,8 +516,8 @@ def call_multi_turn_agent(agent, case_row: dict) -> list[dict]:
 _PER_TURN_CORE = {'query', 'agent_response', 'expected_behavior', 'res_time(s)'}
 # 评测结果字段（每轮独立），通过后缀模式匹配
 _PER_TURN_EVAL_SUFFIXES = ('_score', '_is_success', '_reason', '_threshold')
-# 注意: is_success 是整体标识（_aggregate_multi_turn 已将各子行统一），
-# 不应按轮次展开为 is_success(tN)；每轮明细由 *_is_success(tN) 体现。
+# 子行 is_success 保留各轮结论；合并行 is_success 使用 _parent_all_pass。
+# 不额外展开 is_success(tN)；每轮明细由 *_is_success(tN) 体现。
 _PER_TURN_EVAL_EXACT = {'evaluate_error', 'retry_count'}
 
 
@@ -363,7 +554,7 @@ def _merge_multi_turn_rows(rows: list[dict],
       - 核心字段按轮次展开: query(tN), agent_response(tN), expected_behavior(tN), res_time(s)(tN)
       - 评测字段按轮次展开: *_score(tN), *_is_success(tN), *_reason(tN), *_threshold(tN),
                            evaluate_error(tN), retry_count(tN)
-      - is_success 为整体标识，不按轮次展开
+      - 子行 is_success 保留每轮结果；评价后的合并行以 _parent_all_pass 写入整体 is_success
       - 公共字段（CSV 元数据如 用例编号、类别 等）取首个子行的值，不加后缀
       - 保留 _parent_case_id, _total_turns, _is_multi_turn_sub 元数据
 
@@ -407,6 +598,9 @@ def _merge_multi_turn_rows(rows: list[dict],
         merged['_source_csv'] = sub_rows[0].get('_source_csv', '')
         if '_parent_all_pass' in sub_rows[0]:
             merged['_parent_all_pass'] = sub_rows[0]['_parent_all_pass']
+            # 整体结论取聚合结果，不能沿用第一轮的通过状态。
+            # Agent 阶段写 tmp 时尚未聚合，不额外生成评价结果。
+            merged['is_success'] = merged['_parent_all_pass']
 
         # 每轮字段展开（核心 + 评测结果）
         for i, sub in enumerate(sub_rows, start=1):
@@ -437,10 +631,24 @@ def _merge_multi_turn_rows(rows: list[dict],
     return single_rows + merged_rows
 
 
+def _group_evaluation_rows(rows: list[dict]) -> list[list[dict]]:
+    """按最终输出顺序分组；同一多轮父用例不能跨评价/落盘批次。"""
+    singles = []
+    parents = {}
+    for row in rows:
+        parent_id = row.get('_parent_case_id')
+        if parent_id:
+            parents.setdefault(parent_id, []).append(row)
+        else:
+            singles.append([row])
+    return singles + list(parents.values())
+
+
 def _aggregate_multi_turn(test_case: dict):
     """
     多轮对话聚合判定：全部轮次 is_success 为 True 则父用例整体通过；
-    任一未通过则所有子行标记 is_success=False，提取 bad_case 时自然落入。
+    仅写入 _parent_all_pass，不改写每轮的 is_success 或 evaluate_error。
+    合并输出时，再将父用例结论写入最终行的 is_success。
     """
     csv_rows = test_case['csv']
 
@@ -461,18 +669,6 @@ def _aggregate_multi_turn(test_case: dict):
 
         for row in sub_rows:
             row['_parent_all_pass'] = all_pass
-            if not all_pass:
-                row['is_success'] = False
-                existing_error = row.get('evaluate_error', '') or ''
-                if existing_error:
-                    row['evaluate_error'] = (
-                        f'{existing_error}; '
-                        f'父用例[{parent_id}]存在未通过轮次，整体判定不通过'
-                    )
-                else:
-                    row['evaluate_error'] = (
-                        f'父用例[{parent_id}]存在未通过轮次，整体判定不通过'
-                    )
 
         logger.info(
             f'[聚合] 父用例={parent_id}: '
@@ -485,29 +681,113 @@ class EvaluationPipeline:
     """评测流水线，按阶段串联：准备 → Agent调用 → 评测 → 报告"""
 
     def __init__(self, csv_path: str | None, metrics: list[str] | None, resume: bool = False,
-                 agent_classes: list[str] | None = None):
+                 agent_classes: list[str] | None = None, seed: int | None = None,
+                 fill_preview: bool = False, refresh_entities: bool = False,
+                 resume_result_dir: str | None = None):
         self.conf = ConfigReader.get_instance()
         self.csv_path = csv_path
         self.metrics = metrics
         self.resume = resume
         self.agent_classes = agent_classes
+        self.seed = seed
+        self.fill_preview = fill_preview
+        self.refresh_entities = refresh_entities
+        self.resume_result_dir = resume_result_dir
+        if resume_result_dir is not None and not resume:
+            raise ValueError('--resume-result-dir 必须与 --resume 一起使用')
+
+    def _should_refresh_entities(self) -> bool:
+        """是否刷新实体映射表：CLI --refresh-entities 与配置项取 OR"""
+        conf_enabled = self.conf.get(
+            'dataset.placeholder_fill.refresh_entities', False)
+        return bool(self.refresh_entities or conf_enabled)
+
+    def _is_agent_only(self, agent_class: str) -> bool:
+        """是否仅调用指定 Agent 并在 tmp 中间文件写入后结束。"""
+        return is_agent_only_enabled(agent_class, self.conf)
+
+    def _refresh_entities(self):
+        """刷新实体映射表：调用业务平台接口更新 entity_mapping.json。
+
+        登录或任一采集接口失败时抛 RuntimeError 中断执行（fail fast），
+        避免静默使用过期实体数据导致评测结果失真。
+        """
+        mapping_path = self.conf.get('dataset.placeholder_fill.entity_mapping_path', None)
+        if not mapping_path:
+            raise ValueError(
+                '--refresh-entities 需要配置 dataset.placeholder_fill.entity_mapping_path'
+            )
+        logger.info(f'[实体刷新] 开始调用业务平台接口更新实体映射: {mapping_path}')
+        from tool.business_platform_client import BusinessPlatformClient
+        BusinessPlatformClient().export_entity_mapping(mapping_path)
+        logger.info(f'[实体刷新] 实体映射更新完成: {mapping_path}')
 
     def run(self):
+        if self.fill_preview:
+            if self._should_refresh_entities():
+                self._refresh_entities()
+            self._run_fill_preview()
+            return
         if self.resume:
             test_cases_by_class = self._prepare_from_tmp()
+            # resume 不重新填充，seed 从 tmp meta.json 读取用于报告输出
+            self.seed = self._extract_seed_from_cases(test_cases_by_class)
+            result_dir = getattr(self, 'resume_result_dir', None)
+            test_cases_by_class, summary = prepare_resume(test_cases_by_class, result_dir)
+            mode = '增量恢复' if result_dir is not None else '全量重新评价'
+            message = (f'[resume] {mode}：共 {summary.total} 条，复用 {summary.reused} 条，'
+                       f'待评价 {summary.reevaluate} 条，不可评价 {summary.unavailable} 条')
+            logger.info(message)
+            print(message, flush=True)
+            if result_dir is not None and summary.all_passed:
+                message = '[resume] 全部通过，无需恢复评价；未生成新结果和报告'
+                logger.info(message)
+                print(message, flush=True)
+                return
             self._invoke_agents_resume(test_cases_by_class)
         else:
+            if self._should_refresh_entities():
+                self._refresh_entities()
+            if self.csv_path is None:
+                # 嗅探模式：先扫描 raw 待替换模板 → 填充 → 生成 output_dir 可执行数据集
+                self.seed = fill_raw_datasets(self.seed)
             test_cases_by_class = self._prepare()
-            self._invoke_agents(test_cases_by_class)
+            # 占位符填充（仅命中 target_dirs 的数据集；output_dir 产物自动跳过），
+            # 返回实际使用的 seed
+            self.seed = fill_test_cases(test_cases_by_class, self.seed)
+            test_cases_by_class = self._invoke_agents(test_cases_by_class)
+            if not test_cases_by_class:
+                logger.info('[agent-only] Agent 调用结果已写入 tmp，流水线结束')
+                print('[agent-only] 完成：Agent 调用结果已写入 tmp，未执行评测与报告生成')
+                return
         base_path = self._evaluate(test_cases_by_class)
-        self._report(base_path)
+        self._report(base_path, self.seed)
+
+    # --fill-preview: 仅填充并输出 *.filled.csv，不执行评测
+    def _run_fill_preview(self):
+        seed = preview_fill(self.csv_path, self.seed)
+        print(f'[填充预览] 完成，seed={seed}，可使用同 seed 重跑评测复现测试数据')
+        logger.info(f'[填充预览] 完成，seed={seed}')
+
+    @staticmethod
+    def _extract_seed_from_cases(test_cases_by_class: dict) -> int | None:
+        """从 tmp 加载的 test_case 中提取 meta.json 保存的 seed"""
+        for tc_list in test_cases_by_class.values():
+            for tc in tc_list:
+                seed = tc.get('seed')
+                if seed is not None:
+                    return seed
+        return None
 
     #阶段1: 用例准备
     def _prepare(self) -> dict[str, list[dict]]:
         return make_test_case_list(self.csv_path, self.metrics, self.agent_classes)
 
     #阶段2: Agent 并发调用 + 组装 LLM 用例
-    def _invoke_agents(self, test_cases_by_class: dict[str, list[dict]]):
+    def _invoke_agents(
+        self,
+        test_cases_by_class: dict[str, list[dict]],
+    ) -> dict[str, list[dict]]:
         """
         按 agent 类隔离执行：每个类只处理自己子目录下的用例。
 
@@ -517,6 +797,7 @@ class EvaluationPipeline:
         """
         enabled_classes = get_enabled_classes(self.agent_classes)
         logger.info(f"[阶段2] 启用的 agent 类: {enabled_classes}")
+        evaluation_cases_by_class: dict[str, list[dict]] = {}
 
         max_worker = self.conf.get("agents.http_agent.call_agent_th_max")
         submit_delay = self.conf.get("agents.http_agent.submit_delay", 0)
@@ -528,13 +809,34 @@ class EvaluationPipeline:
             else:
                 target_agents = [class_name]
 
+            agent_only_modes = {
+                agent_cls: self._is_agent_only(agent_cls)
+                for agent_cls in target_agents
+            }
+            if len(set(agent_only_modes.values())) > 1:
+                raise ValueError(
+                    '共享测试集不能同时用于 agent-only 与正常评测 Agent；'
+                    '请通过 -a 分开执行。当前配置: '
+                    f'{agent_only_modes}'
+                )
+            is_agent_only = bool(target_agents) and all(agent_only_modes.values())
+
             # 展平本组用例，构建 case_name → metrics 映射
+            # 同时预计算 _tenant_id、_is_direct_inquiry 等标，避免下游逐 case 反查
             metrics_by_case = {}
             all_cases = []
             for tc in class_test_cases:
-                metrics_by_case[tc['case_name']] = tc['metrics']
+                source = tc['case_name']
+                metrics = tc['metrics']
+                tenant_id = _resolve_tenant_id(source)
+                is_direct = 'direct_inquiry' in source.lower()
+                need_retrieval = bool(RETRIEVAL_METRIC_NAMES & set(metrics))
+                metrics_by_case[source] = metrics
                 for case in tc['csv']:
-                    case['_source_csv'] = tc['case_name']
+                    case['_source_csv'] = source
+                    case['_tenant_id'] = tenant_id
+                    case['_is_direct_inquiry'] = is_direct
+                    case['_need_retrieval'] = need_retrieval
                     all_cases.append(case)
 
             # 字段归一化：推理数据集 第1轮→query, 第1轮对话预期结果→expected_behavior
@@ -567,7 +869,7 @@ class EvaluationPipeline:
                     if agent_cls == 'DataQA':
                         direct_cases = [
                             c for c in single_cases
-                            if 'direct_inquiry' in c.get('_source_csv', '').lower()
+                            if c.get('_is_direct_inquiry')
                         ]
                         other_cases = [
                             c for c in single_cases if c not in direct_cases
@@ -590,6 +892,19 @@ class EvaluationPipeline:
                             partial(call_agent, agent), single_cases,
                             max_workers=max_worker, submit_delay=submit_delay,
                             task_name=f"call_agent({agent_cls}←{class_name})"
+                        )
+
+                    # 检索轨：metrics 中包含检索类指标时，额外调 RAGFlow
+                    retrieval_cases = [
+                        c for c in single_cases if c.get('_need_retrieval')
+                    ]
+                    if retrieval_cases:
+                        retriever = create_agent('RAGFlowRetriever')
+                        run_in_thread_pool(
+                            partial(call_ragflow_retrieve, retriever),
+                            retrieval_cases,
+                            max_workers=max_worker, submit_delay=submit_delay,
+                            task_name=f"RAGFlow检索({agent_cls}←{class_name})"
                         )
 
                 # 多轮：每条用例内部串行（同 session_id），用例间并行
@@ -615,10 +930,16 @@ class EvaluationPipeline:
                 # 合并：单轮（原地已修改）+ 多轮展开子行
                 all_cases = single_cases + expanded_multi
 
-            # 将展开后的结果同步回 test_cases_by_class 结构
+            # 将展开后的结果按 _source_csv 单次遍历分组，回写 test_cases_by_class
+            grouped_by_source: dict[str, list[dict]] = {}
+            for case in all_cases:
+                src = case['_source_csv']
+                if src not in grouped_by_source:
+                    grouped_by_source[src] = []
+                grouped_by_source[src].append(case)
+
             for tc in class_test_cases:
-                source = tc['case_name']
-                tc['csv'] = [c for c in all_cases if c.get('_source_csv') == source]
+                tc['csv'] = grouped_by_source.get(tc['case_name'], [])
 
             # 多轮子行合并为一行（仅用于 tmp 写入，不影响后续 make_llm_case）
             all_cases_for_tmp = _merge_multi_turn_rows(all_cases)
@@ -641,17 +962,27 @@ class EvaluationPipeline:
 
                 meta = {
                     'case_name': src_path,
-                    'metrics': metrics_by_case.get(src_path, [])
+                    'metrics': metrics_by_case.get(src_path, []),
+                    'seed': self.seed,
                 }
                 meta_path = tmp_dir / f'{stem}_tmp.meta.json'
                 meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding='utf-8')
 
                 logger.info(f'[tmp] 已保存中间文件: {meta_path}')
 
-            # 组装 LLM 用例 — 按用例类型分流
+            # agent-only 在 Agent 响应已落盘后截断，不组装 LLMTestCase，也不进入评测。
+            if is_agent_only:
+                logger.info(
+                    f'[agent-only] {class_name}: Agent 调用完成且结果已写入 tmp，'
+                    '跳过 LLMTestCase 组装与评测'
+                )
+                continue
+
+            # 组装 LLM 用例 — 按用例类型分流（skip_assertion 用例不参与组装与断言）
             dataqa_cases = [c for c in all_cases
                             if 'actual_capability_id' in c or 'actual_parameters' in c]
-            other_cases = [c for c in all_cases if c not in dataqa_cases]
+            other_cases = [c for c in all_cases
+                           if c not in dataqa_cases and not _is_skip_assertion(c)]
 
             if other_cases:
                 run_in_thread_pool(
@@ -662,30 +993,53 @@ class EvaluationPipeline:
             for case in dataqa_cases:
                 make_llm_case_structured(case)
 
+            # 检索轨 LLM 用例组装
+            retrieval_cases = [
+                c for c in all_cases if c.get('_need_retrieval')
+            ]
+            if retrieval_cases:
+                run_in_thread_pool(
+                    make_llm_case_retrieval, retrieval_cases,
+                    max_workers=max_worker,
+                    task_name=f'make_llm_retrieval({class_name})'
+                )
+
             ok_dataqa = sum(1 for c in dataqa_cases
                             if 'llm_test_case_capability' in c and 'llm_test_case_params' in c)
             ng_dataqa = len(dataqa_cases) - ok_dataqa
             ok_other = sum(1 for c in other_cases if 'llm_test_case' in c)
             ng_other = len(other_cases) - ok_other
+            ok_retrieval = sum(1 for c in retrieval_cases
+                               if 'llm_test_case_retrieval' in c)
+            ng_retrieval = len(retrieval_cases) - ok_retrieval
 
-            total_ok = ok_dataqa + ok_other
-            total_ng = ng_dataqa + ng_other
-            if total_ng:
+            total_ok = ok_dataqa + ok_other + ok_retrieval
+            total_ng = ng_dataqa + ng_other + ng_retrieval
+            skip_cnt = sum(1 for c in all_cases if _is_skip_assertion(c))
+            if total_ng or skip_cnt:
                 parts = []
                 if ng_other:
                     parts.append(f"文本质量 {ok_other}/{len(other_cases)}")
                 if ng_dataqa:
                     parts.append(f"结构化 {ok_dataqa}/{len(dataqa_cases)}")
+                if ng_retrieval:
+                    parts.append(f"检索 {ok_retrieval}/{len(retrieval_cases)}")
+                if skip_cnt:
+                    parts.append(f"跳过断言 {skip_cnt}")
                 logger.info(
                     f"[阶段2] {class_name}: Agent调用/用例组装 "
-                    f"成功 {total_ok}, 失败 {total_ng} (共 {len(all_cases)}) — "
-                    f"{', '.join(parts)}"
+                    f"成功 {total_ok}, 失败 {total_ng}, 跳过断言 {skip_cnt} "
+                    f"(共 {len(all_cases)}) — {', '.join(parts)}"
                 )
             else:
                 logger.info(
                     f"[阶段2] {class_name}: Agent调用/用例组装 全部成功 "
                     f"({len(all_cases)} 条)"
                 )
+
+            evaluation_cases_by_class[class_name] = class_test_cases
+
+        return evaluation_cases_by_class
 
     # resume: 从 tmp 目录加载中间文件
     def _prepare_from_tmp(self) -> dict[str, list[dict]]:
@@ -704,10 +1058,11 @@ class EvaluationPipeline:
                 logger.warning(f'[resume] {class_name}: 未找到可恢复的测试用例')
                 continue
 
-            # 组装 LLM 用例 — 按用例类型分流
+            # 组装 LLM 用例 — 按用例类型分流（skip_assertion 用例不参与组装与断言）
             dataqa_cases = [c for c in all_cases
                             if 'actual_capability_id' in c or 'actual_parameters' in c]
-            other_cases = [c for c in all_cases if c not in dataqa_cases]
+            other_cases = [c for c in all_cases
+                           if c not in dataqa_cases and not _is_skip_assertion(c)]
 
             if other_cases:
                 run_in_thread_pool(
@@ -719,24 +1074,43 @@ class EvaluationPipeline:
             for case in dataqa_cases:
                 make_llm_case_structured(case)
 
+            # 检索轨 LLM 用例组装
+            retrieval_cases = [
+                c for c in all_cases if c.get('_need_retrieval')
+            ]
+            if retrieval_cases:
+                run_in_thread_pool(
+                    make_llm_case_retrieval, retrieval_cases,
+                    max_workers=max_worker,
+                    task_name=f'make_llm_retrieval_resume({class_name})'
+                )
+
             ok_dataqa = sum(1 for c in dataqa_cases
                             if 'llm_test_case_capability' in c and 'llm_test_case_params' in c)
             ng_dataqa = len(dataqa_cases) - ok_dataqa
             ok_other = sum(1 for c in other_cases if 'llm_test_case' in c)
             ng_other = len(other_cases) - ok_other
+            ok_retrieval = sum(1 for c in retrieval_cases
+                               if 'llm_test_case_retrieval' in c)
+            ng_retrieval = len(retrieval_cases) - ok_retrieval
 
-            total_ok = ok_dataqa + ok_other
-            total_ng = ng_dataqa + ng_other
-            if total_ng:
+            total_ok = ok_dataqa + ok_other + ok_retrieval
+            total_ng = ng_dataqa + ng_other + ng_retrieval
+            skip_cnt = sum(1 for c in all_cases if _is_skip_assertion(c))
+            if total_ng or skip_cnt:
                 parts = []
                 if ng_other:
                     parts.append(f"文本质量 {ok_other}/{len(other_cases)}")
                 if ng_dataqa:
                     parts.append(f"结构化 {ok_dataqa}/{len(dataqa_cases)}")
+                if ng_retrieval:
+                    parts.append(f"检索 {ok_retrieval}/{len(retrieval_cases)}")
+                if skip_cnt:
+                    parts.append(f"跳过断言 {skip_cnt}")
                 logger.info(
                     f"[resume] {class_name}: llm_test_case组装 "
-                    f"成功 {total_ok}, 失败 {total_ng} (共 {len(all_cases)}) — "
-                    f"{', '.join(parts)}"
+                    f"成功 {total_ok}, 失败 {total_ng}, 跳过断言 {skip_cnt} "
+                    f"(共 {len(all_cases)}) — {', '.join(parts)}"
                 )
             else:
                 logger.info(
@@ -746,6 +1120,9 @@ class EvaluationPipeline:
 
     #阶段3: 评测执行 + 结果写入（按 agent 类分目录输出）
     def _evaluate(self, test_cases_by_class: dict[str, list[dict]]) -> str:
+        batch_size = self.conf.get('result.write_batch_size', 20)
+        if type(batch_size) is not int or not 10 <= batch_size <= 30:
+            raise ValueError('result.write_batch_size 必须是 10–30 之间的整数')
         save_path = self.conf.get("result.save_path")
         base_path = mkdir_with_timestamp(save_path)
 
@@ -759,23 +1136,68 @@ class EvaluationPipeline:
             writer = AsyncResultWriter(class_dir)
             writer.start()
 
-            for test_case in class_cases:
-                run_evaluate(test_case)
-                run_evaluate_structured(test_case)
-                run_multimodel_reevaluate(test_case)
-                _aggregate_multi_turn(test_case)
-                recompute_overall_success(test_case)
-                test_case['csv'] = _merge_multi_turn_rows(test_case['csv'],
-                                                          normalize_single_turn=True)
-                writer.submit(test_case, test_case['case_name'])
-
-            writer.wait_and_stop()
+            try:
+                for test_case in class_cases:
+                    groups = _group_evaluation_rows(test_case['csv'])
+                    has_multi_turn = (test_case.get('resume_has_multi_turn', False)
+                                      or any(r.get('_parent_case_id') for r in test_case['csv']))
+                    completed_rows = []
+                    baseline = test_case.get('reused_rows', []) + test_case.get('skipped_rows', [])
+                    baseline = [dict(row) for row in baseline]
+                    if has_multi_turn:
+                        baseline = [_normalize_single_turn_fields(row) if not row.get('_parent_case_id')
+                                    else row for row in baseline]
+                    total = len(groups) + len(baseline)
+                    # 复用记录和不可评价记录不进入任何评价函数，但同样完整提交。
+                    for start in range(0, len(baseline), batch_size):
+                        saved = baseline[start:start + batch_size]
+                        writer.submit({'csv': saved}, test_case['case_name'], append=bool(completed_rows))
+                        writer.flush()
+                        completed_rows.extend(saved)
+                    for offset in range(0, len(groups), batch_size):
+                        rows = [row for group in groups[offset:offset + batch_size]
+                                for row in group]
+                        batch = {**test_case, 'csv': rows}
+                        logger.info(
+                            f"[阶段3] {test_case['case_name']} "
+                            f"评价第 {offset + 1}–{min(offset + batch_size, len(groups))}/{len(groups)} 条"
+                        )
+                        # 无有效评价结果时不得残留输入中的旧整体通过标志。
+                        for row in rows:
+                            row['is_success'] = False
+                        run_evaluate(batch)
+                        run_evaluate_structured(batch)
+                        # 初评只写指标结果，复核筛选前须先汇总本轮通过状态。
+                        recompute_overall_success(batch)
+                        run_multimodel_reevaluate(batch)
+                        # 先汇总复核后的每轮状态，再独立计算父用例整体状态。
+                        recompute_overall_success(batch)
+                        for row in rows:
+                            row['用例是否通过'] = row.get('is_success') is True
+                        _aggregate_multi_turn(batch)
+                        output_rows = _merge_multi_turn_rows(batch['csv'],
+                                                             normalize_single_turn=True)
+                        # 混合数据集中，即使本批全是单轮，也须沿用整表 (t1) 列格式。
+                        if has_multi_turn and not any(r.get('_parent_case_id') for r in batch['csv']):
+                            output_rows = [_normalize_single_turn_fields(r) for r in output_rows]
+                        batch['csv'] = output_rows
+                        writer.submit(batch, test_case['case_name'], append=bool(completed_rows))
+                        # 明确的落盘边界：写入失败时停止，不继续消耗模型请求。
+                        writer.flush()
+                        completed_rows.extend(output_rows)
+                        logger.info(
+                            f"[阶段3] {test_case['case_name']} 已落盘 {len(completed_rows)}/{total} 条"
+                        )
+                    test_case['csv'] = completed_rows
+            finally:
+                # 评价异常/用户中断时，也收尾已提交批次。
+                writer.wait_and_stop()
             print(f'[{class_name}] {writer.get_stats()}')
 
         return base_path
 
     #阶段4: 报告生成（遍历各 agent 子目录）
-    def _report(self, base_path: str):
+    def _report(self, base_path: str, seed: int | None = None):
         for entry in sorted(os.listdir(base_path)):
             class_dir = os.path.join(base_path, entry)
             if not os.path.isdir(class_dir):
@@ -786,7 +1208,7 @@ class EvaluationPipeline:
 
             # 生成评测报告
             report_path = os.path.join(class_dir, 'test_report.md')
-            md_writer = MarkdownWriter(report_path)
+            md_writer = MarkdownWriter(report_path, seed=seed)
 
             for file in sorted(os.listdir(class_dir)):
                 if file.startswith('result_outputs_') and file.endswith('.csv'):
@@ -803,5 +1225,8 @@ if __name__ == "__main__":
     params = parse_args()
     EvaluationPipeline(
         params.csv_path, params.metrics,
-        resume=params.resume, agent_classes=params.agent_classes
+        resume=params.resume, agent_classes=params.agent_classes,
+        resume_result_dir=params.resume_result_dir,
+        seed=params.seed, fill_preview=params.fill_preview,
+        refresh_entities=params.refresh_entities
     ).run()

@@ -4,11 +4,14 @@
 继续移除 _build_client 里的 thinking 参数
 patch 了 generate / a_generate，从 message.content 中跳过 ThinkingBlock，提取真正的 TextBlock.text
 增强 JSON 解析，支持 markdown code block 和前后缀文本
+补全异步评价的进度收尾，避免异常/跳过/取消的用例行残留
 create by:cc
 """
 
 import re
 import json
+import logging
+from functools import wraps
 from json_repair import repair_json
 from deepeval.models.llms import anthropic_model
 from deepeval.models.llms.anthropic_model import require_secret_api_key
@@ -16,6 +19,44 @@ from deepeval.errors import DeepEvalError
 
 
 _PATCHED = False
+logger = logging.getLogger(__name__)
+
+
+def patch_evaluation_progress():
+    """保证每个异步 metric 结束时恰好推进一次用例子进度。
+
+    DeepEval 的 safe_a_measure 在异常/取消/跳过分支不更新进度，导致
+    Rich 子任务无法完成并移除。保留原有评价和异常处理，只把其进度参数
+    置空，将进度更新统一到 finally；多指标并发时也不会重复计数。
+    """
+    from deepeval.metrics import indicator
+
+    original = indicator.safe_a_measure
+    if getattr(original, "_rga_progress_cleanup_patched", False):
+        return
+
+    @wraps(original)
+    async def patched_safe_a_measure(
+        metric, tc, ignore_errors, skip_on_missing_params,
+        progress=None, pbar_eval_id=None, _in_component=False,
+    ):
+        try:
+            return await original(
+                metric, tc, ignore_errors, skip_on_missing_params,
+                progress=None,
+                pbar_eval_id=None,
+                _in_component=_in_component,
+            )
+        finally:
+            try:
+                # update_pbar 对关闭展示或已删除的任务是 no-op；完成时自动移除。
+                indicator.update_pbar(progress, pbar_eval_id)
+            except Exception:
+                # 展示异常不能覆盖模型异常，也不能让正常评分变成失败。
+                logger.warning("DeepEval 子进度清理失败", exc_info=True)
+
+    patched_safe_a_measure._rga_progress_cleanup_patched = True
+    indicator.safe_a_measure = patched_safe_a_measure
 
 
 def _extract_text(message):

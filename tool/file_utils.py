@@ -13,5 +13,13 @@ def mkdir_with_timestamp(base_path: str) -> str:
     """
     timestamp = datetime.now().strftime('%m%d%H%M%S')
     output_dir = os.path.join(base_path, timestamp)
-    os.makedirs(output_dir, exist_ok=True)
-    return output_dir
+    os.makedirs(base_path, exist_ok=True)
+    # 同秒启动或时钟回拨也不得复用已有运行目录。
+    suffix = 0
+    while True:
+        candidate = output_dir if suffix == 0 else f'{output_dir}_{suffix}'
+        try:
+            os.mkdir(candidate)
+            return candidate
+        except FileExistsError:
+            suffix += 1

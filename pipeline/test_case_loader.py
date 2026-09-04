@@ -4,7 +4,9 @@ import json
 import os
 from pathlib import Path
 
-from agents.factory import get_enabled_classes
+from agents.factory import AGENT_CLASS_MAP, get_enabled_classes, is_agent_only_enabled
+from pipeline.resume import source_case_name
+from tool.result_checkpoint import read_csv_prefix
 from tool.csv_reader import CsvReader
 from tool.config_reader import ConfigReader
 from tool.log_factory import LogFactory
@@ -12,16 +14,26 @@ from tool.log_factory import LogFactory
 logger = LogFactory.get_logger(__name__)
 
 
+def _shared_agent_only_mode(conf_reader, agent_classes: list[str] | None) -> bool:
+    """共享 CSV 的所有目标 Agent 是否都启用了 agent-only。"""
+    target_classes = get_enabled_classes(agent_classes)
+    return bool(target_classes) and all(
+        is_agent_only_enabled(class_name, conf_reader)
+        for class_name in target_classes
+    )
+
+
 def _normalize_csv_fields(rows: list[dict]) -> list[dict]:
     """
     将诊断CSV格式的字段名标准化为管线内部字段名。
 
-    诊断CSV列:  question, kg_path, kg_result
+    诊断CSV列:  question, language, kg_path, kg_result
     标准CSV列:  query, expected_behavior, forbidden_behavior
 
     仅当行中包含 'question' 且不包含 'query' 时触发归一化：
       - question → query
-      - kg_path + kg_result → expected_behavior（逗号分隔）
+      - kg_path + kg_result → expected_behavior（仅拼接非空字段，逗号分隔）
+      - language 保持原值，由调用层写入 Diagnosis 的 Language 请求头
 
     :param rows: CsvReader.read_rows() 返回的字典列表
     :return: 标准化后的字典列表（原地修改）
@@ -35,10 +47,15 @@ def _normalize_csv_fields(rows: list[dict]) -> list[dict]:
 
     for row in rows:
         row['query'] = row.get('question', '')
-        row['expected_behavior'] = f"{row.get('kg_path', '')},{row.get('kg_result', '')}"
+        expected_parts = [
+            str(value).strip()
+            for value in (row.get('kg_path'), row.get('kg_result'))
+            if value is not None and str(value).strip()
+        ]
+        row['expected_behavior'] = ','.join(expected_parts)
 
     logger.info(f"已标准化 {len(rows)} 行诊断CSV字段 (question→query, "
-                f"kg_path+kg_result→expected_behavior)")
+                f"kg_path+kg_result非空字段→expected_behavior)")
     return rows
 
 
@@ -85,8 +102,14 @@ def make_test_case_list(csv_path: str | None, metrics: list | None,
             logger.error(f"提供的csv文件路径无效或非csv格式文件: {csv_path}")
             raise ValueError(f"提供的csv文件路径无效或非csv格式文件: {csv_path}")
         if not metrics:
-            logger.error('指定测试数据集时-m参数必传')
-            raise ValueError('指定测试数据集时-m参数必传')
+            if _shared_agent_only_mode(conf_reader, agent_classes):
+                metrics = []
+                logger.info(
+                    '[agent-only] 指定测试数据集时跳过 metrics 必填校验'
+                )
+            else:
+                logger.error('指定测试数据集时-m参数必传')
+                raise ValueError('指定测试数据集时-m参数必传')
         tc = csv_2_case_dict(csv_path, metrics)
         tc['agent_class'] = '__shared__'
         return {'__shared__': [tc]}
@@ -110,8 +133,14 @@ def make_test_case_list(csv_path: str | None, metrics: list | None,
         if os.path.splitext(default_csv_path)[1].lower() == '.csv':
             file_metrics = conf_reader.get('dataset.metrics_if_specify_csv', None)
             if file_metrics is None:
-                logger.error('配置文件中未指定测试数据集使用的metrics')
-                raise ValueError('配置文件中未指定测试数据集使用的metrics')
+                if _shared_agent_only_mode(conf_reader, agent_classes):
+                    file_metrics = []
+                    logger.info(
+                        '[agent-only] 默认单 CSV 跳过 metrics 配置校验'
+                    )
+                else:
+                    logger.error('配置文件中未指定测试数据集使用的metrics')
+                    raise ValueError('配置文件中未指定测试数据集使用的metrics')
             tc = csv_2_case_dict(default_csv_path, file_metrics)
             tc['agent_class'] = '__shared__'
             return {'__shared__': [tc]}
@@ -128,6 +157,11 @@ def make_test_case_list(csv_path: str | None, metrics: list | None,
     logger.info(f'启用的 agent 类: {enabled_classes}')
     result: dict[str, list[dict]] = {}
 
+    # 占位符填充：嗅探时跳过输出目录内的已填充产物（raw 源目录内的文件保留）
+    fill_conf = conf_reader.get('dataset.placeholder_fill', {})
+    fill_output_dir = fill_conf.get('output_dir', None)
+    fill_target_dirs = fill_conf.get('target_dirs', [])
+
     for class_name in enabled_classes:
         sub_dir = os.path.join(default_csv_path, class_name.lower())
         if not os.path.isdir(sub_dir):
@@ -139,20 +173,40 @@ def make_test_case_list(csv_path: str | None, metrics: list | None,
             if not file.startswith('test_cases_') or not file.endswith('.csv'):
                 logger.info(f'[{class_name}] {file} 未被匹配（非 test_cases_*.csv 格式）')
                 continue
+            if fill_output_dir:
+                file_path_full = os.path.join(sub_dir, file)
+                out_abs = os.path.abspath(fill_output_dir)
+                in_output_dir = os.path.abspath(file_path_full).startswith(out_abs + os.sep)
+                # 命中 target_dirs 的路径片段 → raw 源目录（如 dataqa_raw），保留
+                in_raw = any(d for d in fill_target_dirs
+                             if d.replace('\\', '/') in file_path_full.replace('\\', '/'))
+                if in_output_dir and not in_raw:
+                    logger.info(
+                        f'[{class_name}] {file} 位于占位符填充输出目录内'
+                        f'（已填充产物），跳过'
+                    )
+                    continue
 
             data_set_type = file.removeprefix('test_cases_').removesuffix('.csv')
             file_metrics = conf_reader.get(
                 f'dataset.dataset_metrics_map.{data_set_type}', None
             )
             if file_metrics is None:
-                logger.error(
-                    f'[{class_name}] {file} 自动匹配metrics失败，'
-                    f'请在 dataset.dataset_metrics_map 中配置 "{data_set_type}"'
-                )
-                raise ValueError(
-                    f'[{class_name}] {file} 自动匹配metrics失败，'
-                    f'请在 dataset.dataset_metrics_map 中配置 "{data_set_type}"'
-                )
+                if is_agent_only_enabled(class_name, conf_reader):
+                    file_metrics = []
+                    logger.info(
+                        f'[agent-only] [{class_name}] {file} '
+                        '跳过 metrics 自动匹配校验'
+                    )
+                else:
+                    logger.error(
+                        f'[{class_name}] {file} 自动匹配metrics失败，'
+                        f'请在 dataset.dataset_metrics_map 中配置 "{data_set_type}"'
+                    )
+                    raise ValueError(
+                        f'[{class_name}] {file} 自动匹配metrics失败，'
+                        f'请在 dataset.dataset_metrics_map 中配置 "{data_set_type}"'
+                    )
 
             file_path = os.path.join(sub_dir, file)
             tc = csv_2_case_dict(file_path, file_metrics)
@@ -179,9 +233,9 @@ def make_tmp_test_case_list(csv_path: str | None, metrics: list | None,
     按 agent 类名分组返回，与 make_test_case_list 保持一致的 dict 结构。
 
     csv_path 支持三种形式:
-      - None: 从 config 默认路径下各 enabled 类子目录的 tmp/ 扫描
-      - 目录: 扫描 {目录}/tmp/*_tmp.csv → 归入 '__shared__'
-      - *_tmp.csv 文件: 直接加载该文件 → 归入 '__shared__'
+      - None: 从 config 默认路径下已注册 Agent 子目录的 tmp/ 扫描，不受 enabled 影响
+      - 标准 Agent 目录: 扫描 {目录}/tmp/*_tmp.csv，保留真实 Agent 归属
+      - 标准 tmp 中的 *_tmp.csv 文件: 只加载该文件，保留真实 Agent 归属
 
     :param csv_path: 路径 或 None
     :param metrics: CLI 中 -m 指定的指标，非空时覆盖 meta 文件中的值
@@ -192,42 +246,54 @@ def make_tmp_test_case_list(csv_path: str | None, metrics: list | None,
     logger.info('从tmp目录读取测试用例中间文件......')
     print('从tmp目录读取测试用例中间文件......')
     tmp_files: list[tuple[str, dict | None, str]] = []  # (path, meta, agent_class)
+    root = Path(conf_reader.get('dataset.default_dataset_path', 'test_suite')).resolve()
+    if not root.is_dir():
+        raise ValueError(f'标准测试集目录不存在或不是目录: {root}')
+    canonical = {name.casefold(): name for name in AGENT_CLASS_MAP}
+    requested = set()
+    for name in agent_classes or []:
+        if name.casefold() not in canonical:
+            raise ValueError(f'未注册的 Agent: {name}')
+        requested.add(canonical[name.casefold()])
+
+    def collect(agent_dir: Path, only_file: Path | None = None):
+        agent = canonical.get(agent_dir.name.casefold())
+        if agent_dir.parent != root or agent is None:
+            raise ValueError(f'仅支持标准 test_suite/<agent>/tmp 路径: {agent_dir}')
+        if requested and agent not in requested:
+            raise ValueError('-cp 与 -a 指定的 Agent 不一致')
+        directory = agent_dir / 'tmp'
+        if not directory.is_dir():
+            raise ValueError(f'tmp 目录不存在: {directory}')
+        files = [only_file] if only_file else sorted(directory.glob('*_tmp.csv'))
+        for file in files:
+            if file.is_file():
+                tmp_files.append((str(file), _read_meta_for_tmp(str(file)), agent))
 
     if csv_path is not None:
-        if csv_path.endswith('_tmp.csv') and os.path.isfile(csv_path):
-            meta = _read_meta_for_tmp(csv_path)
-            tmp_files.append((csv_path, meta, '__shared__'))
-        elif os.path.isdir(csv_path):
-            tmp_dir = Path(csv_path) / 'tmp'
-            if not tmp_dir.is_dir():
-                raise ValueError(f'tmp目录不存在: {tmp_dir}')
-            for f in tmp_dir.glob('*_tmp.csv'):
-                meta = _read_meta_for_tmp(str(f))
-                tmp_files.append((str(f), meta, '__shared__'))
+        path = Path(csv_path).resolve()
+        if len(requested) > 1:
+            raise ValueError('-cp 只能与同一个 Agent 的 -a 配合使用')
+        if path.is_file() and path.name.endswith('_tmp.csv') and path.parent.name == 'tmp':
+            collect(path.parent.parent, path)
+        elif path.is_dir():
+            collect(path)
         else:
-            raise ValueError(f'无效路径或文件不存在: {csv_path}')
+            raise ValueError(f'非标准 tmp 路径或文件不存在: {path}')
     else:
-        default_path = conf_reader.get('dataset.default_dataset_path', None)
-        if default_path is None:
-            raise ValueError(
-                '未指定测试数据集路径，且配置文件中无dataset.default_dataset_path配置'
-            )
-        # 遍历各 enabled 类子目录下的 tmp/
-        for entry in sorted(os.listdir(default_path)):
-            entry_path = os.path.join(default_path, entry)
-            if not os.path.isdir(entry_path):
+        seen = set()
+        for directory in sorted(root.iterdir()):
+            agent = canonical.get(directory.name.casefold())
+            if not directory.is_dir() or agent is None or (requested and agent not in requested):
                 continue
-            # 子目录名映射为类名: diagnosis → Diagnosis
-            agent_class = _dir_to_class_name(entry)
-            # 若指定了 agent_classes，只加载匹配的类（忽略大小写）
-            if agent_classes and agent_class.lower() not in (a.lower() for a in agent_classes):
-                continue
-            tmp_dir = Path(entry_path) / 'tmp'
-            if not tmp_dir.is_dir():
-                continue
-            for f in tmp_dir.glob('*_tmp.csv'):
-                meta = _read_meta_for_tmp(str(f))
-                tmp_files.append((str(f), meta, agent_class))
+            if agent in seen:
+                raise ValueError(f'Agent 目录存在大小写歧义: {directory}')
+            seen.add(agent)
+            if (directory / 'tmp').is_dir():
+                collect(directory)
+        found = {agent for _, _, agent in tmp_files}
+        if requested - found:
+            raise ValueError(f'指定 Agent 未找到 tmp 用例: {sorted(requested - found)}')
 
     if not tmp_files:
         raise ValueError('未找到任何 *_tmp.csv 中间文件，请先执行正常评测流程生成中间文件')
@@ -244,17 +310,20 @@ def make_tmp_test_case_list(csv_path: str | None, metrics: list | None,
             file_metrics = conf_reader.get('dataset.metrics_if_specify_csv', [])
 
         if not file_metrics:
-            logger.warning(f'{tmp_csv} 未找到对应的metrics配置，跳过')
-            continue
+            raise ValueError(f'{tmp_csv} 未找到对应的 metrics 配置')
 
         # case_name 优先取 meta 中保存的原始路径
-        case_name = meta['case_name'] if meta and meta.get('case_name') else tmp_csv
+        rows, _ = read_csv_prefix(Path(tmp_csv))
+        case_name = source_case_name(Path(tmp_csv), meta, rows)
 
         test_cases = {
-            'csv': CsvReader(tmp_csv).read_rows(),
+            'csv': rows,
             'case_name': case_name,
+            'tmp_path': tmp_csv,
             'metrics': file_metrics,
             'agent_class': agent_class,
+            # 占位符填充 seed（占位符填充已在前一轮完成，这里仅透传供报告输出）
+            'seed': meta.get('seed') if meta else None,
         }
         result.setdefault(agent_class, []).append(test_cases)
         logger.info(f'[resume] 加载中间文件: {tmp_csv} (class={agent_class}, case_name={case_name}, metrics={file_metrics})')
@@ -272,5 +341,8 @@ def _read_meta_for_tmp(tmp_csv_path: str) -> dict | None:
     """读取 tmp CSV 对应的 meta.json 文件，不存在时返回 None"""
     meta_path = Path(tmp_csv_path).with_suffix('.meta.json')
     if meta_path.is_file():
-        return json.loads(meta_path.read_text(encoding='utf-8'))
+        meta = json.loads(meta_path.read_text(encoding='utf-8'))
+        if not isinstance(meta, dict):
+            raise ValueError(f'tmp meta 必须为 JSON 对象: {meta_path}')
+        return meta
     return None

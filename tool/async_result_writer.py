@@ -3,7 +3,7 @@ import queue
 import threading
 from pathlib import Path
 
-from tool.csv_writer import CsvWriter
+from tool.result_checkpoint import CheckpointWriter
 
 
 class AsyncResultWriter:
@@ -26,6 +26,8 @@ class AsyncResultWriter:
         self.error_count = 0
         self.success_count = 0
         self._lock = threading.Lock()
+        self._write_error = None
+        self._checkpoint_writers = {}
 
     def start(self):
         """启动异步写入线程"""
@@ -49,53 +51,76 @@ class AsyncResultWriter:
                 # 从队列获取结果,超时 1 秒避免死锁
                 task = self.result_queue.get(timeout=1)
 
+            except queue.Empty:
+                continue
+
+            try:
                 if task is None:  # 毒丸信号,退出
                     break
 
-                test_case, case_name = task
-
-                # 执行写入
+                rows, case_name, append = task
+                self._raise_if_failed()
                 csv_file_name = os.path.basename(case_name)
                 result_output = csv_file_name.replace('test_case', 'result_output')
                 result_csv_path = os.path.join(self.base_path, result_output)
-
-                csv_writer = CsvWriter(str(result_csv_path))
-                csv_writer.write_rows(test_case['csv'])
+                if result_csv_path not in self._checkpoint_writers:
+                    self._checkpoint_writers[result_csv_path] = CheckpointWriter(
+                        result_csv_path, self.base_path.name,
+                    )
+                elif not append:
+                    raise ValueError(f'拒绝覆盖已提交的结果: {result_csv_path}')
+                self._checkpoint_writers[result_csv_path].commit(rows)
 
                 with self._lock:
                     self.success_count += 1
-
-                print(f"结果已写入: {result_output}")
-
-                self.result_queue.task_done()
-
-            except queue.Empty:
-                continue
+                print(f"结果与 checkpoint 已提交: {result_output}（本批 {len(rows)} 条）", flush=True)
             except Exception as e:
                 with self._lock:
                     self.error_count += 1
+                    if self._write_error is None:
+                        self._write_error = e
                 print(f"写入失败: {e}")
+            finally:
                 self.result_queue.task_done()
 
-    def submit(self, test_case: dict, case_name: str):
+    def submit(self, test_case: dict, case_name: str, *, append: bool = False):
         """
         提交结果到写入队列
 
         :params: test_case: 测试用例字典,包含 'csv' 键
         :params: case_name: 用例名称,用于生成输出文件名
+        :params: append: 是否追加本运行已提交的结果，False 仅用于首次创建
         """
         if self.writer_thread is None or not self.writer_thread.is_alive():
             raise RuntimeError("写入线程未启动,请先调用 start()")
 
-        self.result_queue.put((test_case, case_name))
+        self._raise_if_failed()
+        # 固定本批字段值，避免调用方后续回写同一行影响队列中的结果。
+        rows = [dict(row) for row in test_case['csv']]
+        self.result_queue.put((rows, case_name, append))
+
+    def _raise_if_failed(self):
+        with self._lock:
+            error = self._write_error
+        if error is not None:
+            raise RuntimeError(f"评价结果写入失败: {error}") from error
+
+    def flush(self):
+        """等待 CSV 与 checkpoint 均提交；失败交回主线程，不继续评价。"""
+        self.result_queue.join()
+        self._raise_if_failed()
 
     def wait_and_stop(self):
         """等待所有写入完成并停止线程"""
+        if self.writer_thread is None or not self.writer_thread.is_alive():
+            self._raise_if_failed()
+            return
         print("等待所有结果写入完成...")
         self.result_queue.join()  # 等待队列清空
         self.result_queue.put(None)  # 发送毒丸信号
         self.writer_thread.join()  # 等待线程退出
 
+        self._raise_if_failed()
         print(f"所有结果已写入完成 (成功: {self.success_count}, 失败: {self.error_count})")
 
     def get_stats(self) -> dict:

@@ -5,8 +5,10 @@ from typing import Dict, List
 class MarkdownWriter:
     """Markdown 报告写入器，实例化时传入完整路径包含输出文件名"""
 
-    def __init__(self, output_path: str):
+    def __init__(self, output_path: str, seed: int | None = None):
         self.output_path = output_path
+        # 占位符填充随机种子，用于复现本次评测的测试数据（None 时不输出）
+        self.seed = seed
         self._is_write_title = False
         parent_dir = os.path.dirname(self.output_path)
         if parent_dir:
@@ -17,6 +19,8 @@ class MarkdownWriter:
             lines.append(f"# 评测报告")
             lines.append("")
             lines.append(f"生成时间: {self._now()}")
+            if self.seed is not None:
+                lines.append(f"占位符填充 seed: {self.seed}")
             lines.append("")
             self._is_write_title = True
 

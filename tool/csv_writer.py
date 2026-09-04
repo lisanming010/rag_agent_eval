@@ -1,4 +1,6 @@
 import csv
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -51,6 +53,41 @@ class CsvWriter:
                 writer.writeheader()
             writer.writerows(data)
 
+    def append_rows(self, data: List[Dict[str, Any]]) -> None:
+        """按已有表头追加；新增字段时流式扩展旧表并原子替换，避免批次错列。"""
+        if not data:
+            raise ValueError("数据列表不能为空")
+        if not self.csv_path.exists() or self.csv_path.stat().st_size == 0:
+            self.write_rows(data)
+            return
+
+        with self.csv_path.open('r', encoding='utf-8-sig', newline='') as source:
+            old_fields = next(csv.reader(source), [])
+        fields = list(dict.fromkeys(old_fields + [key for row in data for key in row]))
+        if fields == old_fields:
+            self.write_rows(data, fieldnames=fields, mode='a')
+            return
+
+        # Agent 响应/评测理由可能超过 csv 默认的单字段 128 KiB 上限。
+        csv.field_size_limit(max(csv.field_size_limit(), 2 ** 31 - 1))
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode='w', encoding='utf-8-sig', newline='',
+                dir=self.csv_path.parent, prefix=f'.{self.csv_path.name}.',
+                suffix='.tmp', delete=False,
+            ) as target:
+                temporary_path = Path(target.name)
+                writer = csv.DictWriter(target, fieldnames=fields)
+                writer.writeheader()
+                with self.csv_path.open('r', encoding='utf-8-sig', newline='') as source:
+                    writer.writerows(csv.DictReader(source))
+                writer.writerows(data)
+            os.replace(temporary_path, self.csv_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
     def write_from_test_cases(
         self,
         data: List[Dict[str, Any]],
@@ -90,4 +127,3 @@ if __name__ == "__main__":
     writer = CsvWriter(output_path)
     writer.write_rows(sample_data)
     print(f"CSV 文件已写入: {output_path}")
-

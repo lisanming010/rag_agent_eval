@@ -94,8 +94,13 @@ class PVAssistant:
         
 class Diagnosis:
     """
-    诊断智能体，调用诊断推理API接口（默认 blocking 模式）
+    诊断智能体，调用诊断推理 API 接口（默认 SSE streaming 模式）
     """
+
+    DEFAULT_LANGUAGE = "zh-CN"
+    SUPPORTED_LANGUAGES = frozenset({"zh-CN", "en-US"})
+    DEFAULT_RESPONSE_MODE = "streaming"
+    SUPPORTED_RESPONSE_MODES = frozenset({"blocking", "streaming"})
 
     def __init__(self, base_url: str, business_token: str):
         self.base_url = base_url
@@ -111,18 +116,30 @@ class Diagnosis:
 
     @_timing
     def call_agent(self, question: str, user: str = "lisanming-auto-test",
-                   session_id: str = None, res_mode: str = "blocking", **kwargs):
+                   session_id: str = None, res_mode: str = DEFAULT_RESPONSE_MODE,
+                   language: str = DEFAULT_LANGUAGE, **kwargs):
         """
         调用诊断智能体
 
         :param question: 诊断问题，如 "故障码1616"
         :param user: 调用方用户标识
         :param session_id: 会话ID，默认自动生成 UUID
-        :param res_mode: 响应模式，默认 blocking（streaming 暂未实现）
+        :param res_mode: 响应模式，默认 streaming；兼容后端返回的 SSE/JSON
+        :param language: 响应语言请求头，仅支持 zh-CN / en-US，默认 zh-CN
         :return: (response_raw, response_summary, res_time)
         """
-        if res_mode != "blocking":
-            raise NotImplementedError("Diagnosis 当前仅支持 blocking 模式")
+        if res_mode not in self.SUPPORTED_RESPONSE_MODES:
+            supported_modes = ", ".join(sorted(self.SUPPORTED_RESPONSE_MODES))
+            raise ValueError(
+                f"Diagnosis res_mode 仅支持 {supported_modes}，实际值: {res_mode!r}"
+            )
+
+        language = str(language or self.DEFAULT_LANGUAGE).strip()
+        if language not in self.SUPPORTED_LANGUAGES:
+            supported = ", ".join(sorted(self.SUPPORTED_LANGUAGES))
+            raise ValueError(
+                f"Diagnosis language 仅支持 {supported}，实际值: {language!r}"
+            )
 
         if session_id is None:
             session_id = str(uuid.uuid4())
@@ -138,26 +155,104 @@ class Diagnosis:
 
         headers = dict(self._base_header)
         headers['X-Session-Id'] = session_id
+        headers['Language'] = language
+        if res_mode == "streaming":
+            headers['Accept'] = 'text/event-stream'
 
-        response = requests.post(self.base_url, data=payload, headers=headers)
-        if response.status_code != 200:
-            logger.error(
-                f"诊断Agent调用失败，状态码: {response.status_code}, "
-                f"响应内容: {response.text}"
-            )
-            raise RuntimeError(
-                f"诊断Agent调用失败，状态码: {response.status_code}, "
-                f"响应内容: {response.text}"
-            )
-
+        response = requests.post(
+            self.base_url,
+            data=payload,
+            headers=headers,
+            stream=res_mode == "streaming",
+        )
         try:
-            response_raw = response.json()
-            response_summary = response_raw['content']['data']['markdown']
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            logger.error(f"诊断响应解析失败: {e}, 响应内容: {response.text}")
-            raise RuntimeError(f"诊断响应解析失败: {e}")
-        else:
+            if response.status_code != 200:
+                error_message = (
+                    f"诊断Agent调用失败，状态码: {response.status_code}, "
+                    f"响应内容: {response.text}"
+                )
+                logger.error(error_message)
+                raise RuntimeError(error_message)
+            content_type = response.headers.get('Content-Type', '').lower()
+            if 'text/event-stream' in content_type:
+                return self._parse_sse_response(response)
+            return self._parse_json_response(response)
+        except RuntimeError:
+            raise
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.error(f"诊断响应解析失败: {e}")
+            raise RuntimeError(f"诊断响应解析失败: {e}") from e
+        finally:
+            close = getattr(response, 'close', None)
+            if callable(close):
+                close()
+
+    @staticmethod
+    def _parse_json_response(response):
+        """解析兼容的非流式 JSON 响应。"""
+        response_raw = response.json()
+        response_summary = response_raw['content']['data']['markdown']
+        if not isinstance(response_summary, str) or not response_summary.strip():
+            raise ValueError("JSON 响应中的 markdown 内容为空")
+        return response_raw, response_summary
+
+    @staticmethod
+    def _parse_sse_response(response):
+        """解析诊断接口 SSE，优先提取 complete.data.content。"""
+        complete_event = None
+        delta_parts = []
+        event_count = 0
+
+        for raw_line in response.iter_lines(decode_unicode=True):
+            if isinstance(raw_line, bytes):
+                line = raw_line.decode('utf-8')
+            else:
+                line = str(raw_line or '')
+            line = line.strip()
+            if not line or line.startswith(':') or not line.startswith('data:'):
+                continue
+
+            event_payload = line[len('data:'):].strip()
+            if not event_payload or event_payload == '[DONE]':
+                continue
+
+            event = json.loads(event_payload)
+            event_count += 1
+            event_type = event.get('event_type') or event.get('eventType')
+            event_data = event.get('data') or {}
+
+            if event_type == 'delta':
+                delta = event_data.get('contentDelta') or event_data.get('content')
+                if isinstance(delta, str):
+                    delta_parts.append(delta)
+            elif event_type == 'complete':
+                if event_data.get('status') not in (None, 'SUCCESS'):
+                    raise ValueError(
+                        f"SSE complete 状态异常: {event_data.get('status')!r}"
+                    )
+                content = event_data.get('content')
+                if not isinstance(content, str) or not content.strip():
+                    raise ValueError("SSE complete 事件缺少 data.content")
+                complete_event = event
+            elif event_type == 'error':
+                raise ValueError(f"SSE error 事件: {event_data}")
+
+        if complete_event is not None:
+            return complete_event, complete_event['data']['content']
+
+        if delta_parts:
+            response_summary = ''.join(delta_parts)
+            response_raw = {
+                'event_type': 'complete',
+                'data': {
+                    'status': 'SUCCESS',
+                    'content': response_summary,
+                    'source': 'delta_fallback',
+                },
+            }
             return response_raw, response_summary
+
+        raise ValueError(f"SSE 响应未包含 complete 或 delta 内容（事件数: {event_count}）")
 
 
 class DataQA:

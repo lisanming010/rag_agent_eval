@@ -49,38 +49,42 @@ def _resolve_metrics(metrics_str: list[str]) -> list:
     return metrics
 
 
-def run_evaluate(test_case: dict):
-    """
-    执行evaluate，内置重试机制，并将执行结果写回用例字典中
+# 检索类指标名称 — 需路由到 llm_test_case_retrieval 的指标
+RETRIEVAL_METRICS = {'mrr', 'recallk', 'precisionk'}
 
-    :param test_case: 测试数据集, 即测试用例list中的整个成员，如 test_case_list[0]
+
+def _batch_evaluate(cases: list[dict], tc_key: str, metrics: list,
+                    track_label: str):
+    """单轨评测：evaluate → 重试 → 回写 per-metric 字段
+
+    :param cases: 用例 dict 列表（原地修改）
+    :param tc_key: LLMTestCase 在 case dict 中的 key，如 'llm_test_case' 或 'llm_test_case_retrieval'
+    :param metrics: deepeval metric 实例列表
+    :param track_label: 日志标签，如 '文本质量'、'检索'
     """
+    if not metrics:
+        return
 
     conf_reader = ConfigReader.get_instance()
 
-    test_case_csv = test_case['csv']
+    valid_cases = [c for c in cases if tc_key in c]
+    skipped = [c for c in cases if tc_key not in c]
 
-    # 分离出缺少 llm_test_case 的用例（make_llm_case 阶段已失败）
-    valid_cases = [case for case in test_case_csv if 'llm_test_case' in case]
-    skipped_cases = [case for case in test_case_csv if 'llm_test_case' not in case]
+    for case in skipped:
+        if 'is_success' not in case:
+            case['is_success'] = False
+        if 'evaluate_error' not in case:
+            case['evaluate_error'] = f'{tc_key}缺失，无法执行{track_label}评测'
 
-    if skipped_cases:
-        for case in skipped_cases:
-            if 'is_success' not in case:
-                case['is_success'] = False
-            if 'evaluate_error' not in case:
-                case['evaluate_error'] = 'llm_test_case缺失，无法执行评测'
-        logger.info(f"[跳过] {len(skipped_cases)} 条用例缺少 llm_test_case，已标记为失败")
+    if skipped:
+        logger.info(f"[{track_label}] 跳过 {len(skipped)} 条缺少 {tc_key} 的用例")
 
     if not valid_cases:
-        logger.error("[中止] 没有可评测的有效用例")
+        logger.warning(f"[{track_label}] 无有效用例，跳过评测")
         return
 
-    # 提取字典中所有 llm_test_case
-    llm_test_case = [case['llm_test_case'] for case in valid_cases]
-    metrics = _resolve_metrics(test_case['metrics'])
+    llm_cases = [c[tc_key] for c in valid_cases]
 
-    #读取 retry 配置
     eval_max_retries = conf_reader.get('retry.eval_max_retries', 2)
     retry_backoff_base = conf_reader.get('retry.backoff_base', 2)
     retry_max_backoff = conf_reader.get('retry.max_backoff', 60)
@@ -90,9 +94,9 @@ def run_evaluate(test_case: dict):
     eva_max_concurrent = conf_reader.get('evluate.max_concurrent')
     eva_throttle_value = conf_reader.get('evluate.throttle_value')
 
-    #首次全量 evaluate
+    # 首次全量 evaluate
     result = evaluate(
-        llm_test_case,
+        llm_cases,
         metrics,
         async_config=AsyncConfig(
             run_async=eva_run_async,
@@ -102,15 +106,8 @@ def run_evaluate(test_case: dict):
         error_config=ErrorConfig(ignore_errors=True)
     )
 
-    # 异步模式下 deepeval 不保证 test_results 顺序与输入一致，
-    # 因此按 test_result.input（原始query）建立索引后再回写，避免张冠李戴
     result_map = {tr.input: tr for tr in result.test_results}
 
-    # 收集因 LLM 报错被跳过的用例（仅从有效用例中查找）
-    # - query 不在 result_map 中：deepeval 直接丢弃了该用例
-    # - query 在 result_map 但 metrics_data 为空：评测未执行完就报错
-    # 注意：metrics_data 非空但 success=False 是正常低分，不重试
-    # 检查 metric score 是否缺失：空列表或任一 score 为 None 均视为未完整执行
     def _score_missing(tr):
         if not tr.metrics_data:
             return True
@@ -131,7 +128,7 @@ def run_evaluate(test_case: dict):
 
         completed = initial_pending - len(pending)
         if retry_verbose:
-            logger.info(f"[重试] 第 {retry_round}/{eval_max_retries} 轮，"
+            logger.info(f"[{track_label} 重试] 第 {retry_round}/{eval_max_retries} 轮，"
                         f"已完成 {completed}/{initial_pending}，"
                         f"待重试 {len(pending)} 条，等待 {delay:.1f}s")
 
@@ -141,9 +138,8 @@ def run_evaluate(test_case: dict):
         for idx, case in enumerate(pending):
             query = case['query']
             try:
-                # 单用例重试时关闭 ignore_errors，让异常暴露出来
                 retry_result = evaluate(
-                    [case['llm_test_case']],
+                    [case[tc_key]],
                     metrics,
                     error_config=ErrorConfig(ignore_errors=False)
                 )
@@ -163,33 +159,64 @@ def run_evaluate(test_case: dict):
 
         pending = still_pending
 
-    #最终失败标记
+    # 最终失败标记
     for case in pending:
         case['is_success'] = False
-        case['evaluate_error'] = f"经过{eval_max_retries}轮重试后仍无评测结果"
+        case['evaluate_error'] = f"[{track_label}] 经过{eval_max_retries}轮重试后仍无评测结果"
         case['retry_count'] = eval_max_retries
         if retry_verbose:
-            logger.error(f"[失败] query='{case['query'][:60]}' 经{eval_max_retries}轮重试仍失败")
+            logger.error(f"[{track_label} 失败] query='{case['query'][:60]}' "
+                         f"经{eval_max_retries}轮重试仍失败")
 
-    # 结果回写
-    for case_dict in test_case_csv:
+    # 结果回写（仅 per-metric 字段，is_success 由 recompute_overall_success 统一计算）
+    for case_dict in cases:
         query = case_dict['query']
         test_result = result_map.get(query)
         if test_result is None:
-            # 已在上面标记过 evaluate_error，这里仅补充 is_success 兜底
-            if 'is_success' not in case_dict:
-                case_dict['is_success'] = False
-                case_dict['用例是否通过'] = False
             continue
 
-        case_dict['is_success'] = test_result.success
-        case_dict['用例是否通过'] = test_result.success
         for md in test_result.metrics_data:
             metrics_name = md.name
             case_dict[f'{metrics_name}_is_success'] = md.success
             case_dict[f'{metrics_name}_score'] = md.score
             case_dict[f'{metrics_name}_threshold'] = md.threshold
             case_dict[f'{metrics_name}_reason'] = md.reason
+
+
+def run_evaluate(test_case: dict):
+    """双轨评测：按 metric 类型分流到文本轨 / 检索轨
+
+    文本轨 → llm_test_case → reverse_validation, contextual_recall 等
+    检索轨 → llm_test_case_retrieval → mrr, recallk, precisionk
+    """
+    test_case_csv = test_case['csv']
+    configured = test_case['metrics']
+
+    text_metrics = [m for m in configured if m not in RETRIEVAL_METRICS]
+    retrieval_metrics = [m for m in configured if m in RETRIEVAL_METRICS]
+
+    if text_metrics:
+        _batch_evaluate(
+            test_case_csv, 'llm_test_case',
+            _resolve_metrics(text_metrics), '文本质量'
+        )
+
+    if retrieval_metrics:
+        _batch_evaluate(
+            test_case_csv, 'llm_test_case_retrieval',
+            _resolve_metrics(retrieval_metrics), '检索'
+        )
+
+    # 兜底：完全缺失 LLMTestCase 的用例标记失败
+    for case in test_case_csv:
+        has_text = 'llm_test_case' in case
+        has_retrieval = 'llm_test_case_retrieval' in case
+        if not has_text and not has_retrieval:
+            if 'is_success' not in case:
+                case['is_success'] = False
+                case['用例是否通过'] = False
+            if 'evaluate_error' not in case:
+                case['evaluate_error'] = '所有LLMTestCase均缺失，无法执行评测'
 
 
 def run_multimodel_reevaluate(test_case: dict):
@@ -219,7 +246,7 @@ def run_multimodel_reevaluate(test_case: dict):
     # 筛选 bad_cases
     bad_cases = [
         case for case in test_case_csv
-        if 'llm_test_case' in case and case.get('is_success') != True
+        if 'llm_test_case' in case and case.get('is_success') is not True
     ]
     if not bad_cases:
         logger.info(f"[多模型复核] 无 bad_case，跳过")
@@ -241,9 +268,10 @@ def run_multimodel_reevaluate(test_case: dict):
     _batch_reevaluate(bad_cases, model3_metrics, 'model3',
                       eva_run_async, eva_max_concurrent, eva_throttle_value)
 
-    # 逐条投票
+    # 按计划复核的指标投票，调用失败或无返回结果也必须计入失败票。
+    reviewed_metric_names = [metric.__name__ for metric in model2_metrics.values()]
     for case in bad_cases:
-        _apply_voting(case)
+        _apply_voting(case, reviewed_metric_names)
 
 
 def _batch_reevaluate(bad_cases: list[dict], metrics_map: dict, model_label: str,
@@ -335,31 +363,26 @@ def _batch_reevaluate(bad_cases: list[dict], metrics_map: dict, model_label: str
             case[f'{md.name}_{model_label}_threshold'] = md.threshold
 
 
-def _apply_voting(case: dict):
+def _apply_voting(case: dict, metric_names: list[str]):
     """
     基于三模型投票更新 case 的最终 is_success：
-    对每个被复核过的指标，若 model1/model2/model3 中 ≥2 个判定不通过则最终不通过。
+    对每个计划复核的指标，仅布尔 True 算通过，三模型中至少两个通过才最终通过。
+    缺失、None 和其他非 True 值均计为失败票。
     整体 is_success = 所有指标的最终结果取 AND。
     """
-    # 找到所有被 model2 复核过的指标列
-    model2_success_keys = [k for k in case if k.endswith('_model2_is_success')]
+    for metric_prefix in metric_names:
+        m1 = case.get(f'{metric_prefix}_is_success')
+        m2 = case.get(f'{metric_prefix}_model2_is_success')
+        m3 = case.get(f'{metric_prefix}_model3_is_success')
 
-    for m2_key in model2_success_keys:
-        # contextual_recall_model2_is_success → contextual_recall
-        metric_prefix = m2_key.removesuffix('_model2_is_success')
-
-        m1 = case.get(f'{metric_prefix}_is_success', True)
-        m2 = case.get(f'{metric_prefix}_model2_is_success', True)
-        m3 = case.get(f'{metric_prefix}_model3_is_success', True)
-
-        fail_count = sum(1 for v in (m1, m2, m3) if not v)
-        case[f'{metric_prefix}_is_success'] = fail_count < 2
+        pass_count = sum(1 for v in (m1, m2, m3) if v is True)
+        case[f'{metric_prefix}_is_success'] = pass_count >= 2
 
     # 重新计算整体 is_success：所有指标 _is_success 取 AND
     all_success = True
     for key, val in case.items():
         if key.endswith('_is_success') and key != 'is_success' and '_model' not in key:
-            if not val:
+            if val is not True:
                 all_success = False
                 break
     case['is_success'] = all_success
@@ -420,7 +443,7 @@ def _eval_single_structured_metric(csv_rows: list[dict], metric, tc_key: str):
 
 
 def recompute_overall_success(test_case: dict):
-    """基于所有 *_is_success 字段（排除 _model）取 AND，重算 is_success。"""
+    """所有 *_is_success 字段（排除 _model）均为布尔 True 才通过。"""
     for case in test_case['csv']:
         metric_keys = [
             k for k in case
@@ -430,6 +453,6 @@ def recompute_overall_success(test_case: dict):
         ]
         if not metric_keys:
             continue
-        all_pass = all(case[k] in (True, 'True') for k in metric_keys)
+        all_pass = all(case[k] is True for k in metric_keys)
         case['is_success'] = all_pass
         case['用例是否通过'] = all_pass

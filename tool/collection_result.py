@@ -1,4 +1,5 @@
 import os
+import re
 import numpy as np
 
 from tool.csv_reader import CsvReader
@@ -14,8 +15,9 @@ class CollectionResult:
         metrics_name_list = []
         csv_header = self.csv_reader.get_headers()
         for key in csv_header:
-            if "_is_success" in key:
-                metrics_name_list.append(key.removesuffix('_is_success'))
+            match = re.fullmatch(r'(.+)_is_success(?:\(t\d+\))?', key)
+            if match and match.group(1) not in metrics_name_list:
+                metrics_name_list.append(match.group(1))
         return metrics_name_list           
 
     def task_success_stats(self)->dict:
@@ -34,26 +36,25 @@ class CollectionResult:
         total_task_count = len(results_list)
 
         for result in results_list:
-            # is_success 是整体标识（单轮直接取，多轮合并行由 _aggregate_multi_turn 统一）
+            # is_success 是整体标识（单轮直接取，多轮合并行从 _parent_all_pass 写入）。
             if str(result.get('is_success', '')).strip().upper() == 'TRUE':
                 task_success_count['total'] += 1
             for metric in metrics:
                 metric_key = f'{metric}_is_success'
                 metric_val = result.get(metric_key)
-                if metric_val is not None:
+                if metric_val not in (None, ''):
                     if str(metric_val).strip().upper() == 'TRUE':
                         task_success_count[metric] += 1
                 else:
                     # 多轮合并行：检查 *_is_success(t1), *_is_success(t2) ... 全部通过才算通过
-                    turn_vals = [
-                        v for k, v in result.items()
-                        if k.startswith(metric_key + '(') and '_model' not in k
-                    ]
+                    # CSV 联合表头包含其他用例的额外轮次；仅统计该用例自身轮次。
+                    count = int(result.get('_total_turns') or 1) if result.get('_parent_case_id') else 1
+                    turn_vals = [result.get(f'{metric_key}(t{i})', '') for i in range(1, count + 1)]
                     if turn_vals and all(str(v).strip().upper() == 'TRUE' for v in turn_vals):
                         task_success_count[metric] += 1
 
         task_success_rate = {
-            key: round(count / total_task_count, 4)*100
+            key: round(count / total_task_count, 4)*100 if total_task_count else 0
             for key, count in task_success_count.items()
         }
 

@@ -64,3 +64,15 @@ def get_enabled_classes(cli_classes: list[str] | None = None) -> list[str]:
         c for c in all_classes
         if conf.get(f'agents.http_agent.class_config.{c}.enabled', False)
     ]
+
+
+def is_agent_only_enabled(class_name: str, conf=None) -> bool:
+    """判断指定 Agent 是否只执行调用阶段，兼容 YAML bool 与字符串配置。"""
+    conf = conf or ConfigReader.get_instance()
+    value = conf.get(
+        f'agents.http_agent.class_config.{class_name}.is_agent_only',
+        False,
+    )
+    if isinstance(value, str):
+        return value.strip().upper() in ('TRUE', 'YES', '1')
+    return bool(value)

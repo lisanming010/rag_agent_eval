@@ -15,18 +15,23 @@ agents:
     class_config:
       PVAssistant:
         enabled: true
+        # true 时仅调用 Agent 并写入 tmp，不执行评测与报告生成
+        is_agent_only: false
         endpoint: https://xxxx
         business_token: test
       Diagnosis:
         enabled: false
+        is_agent_only: false
         endpoint: ""
         business_token: ""
       DataQA:
         enabled: false
+        is_agent_only: false
         endpoint: ""
         business_token: ""
       RAGFlowRetriever:
         enabled: false
+        is_agent_only: false
     # RAGFlow 知识库检索配置
     ragflow:
       api_url: http://192.168.100.225
@@ -102,12 +107,37 @@ dataset:
     multiturn:
       - reverse_validation
       - contextual_recall
+    sungrow_general_zh:
+      - contextual_recall
+    sungrow_general_en:
+      - contextual_recall
+
+  # 占位符填充：执行前将测试数据中的 [xxx] 替换为实体映射中的随机实体
+  placeholder_fill:
+    # 是否需要执行占位符替换
+    enabled: true
+    # 是否需要刷新实体映射表：执行替换前先调用业务平台接口更新 entity_mapping.json
+    # （登录/接口失败时中断执行；也可用 CLI 参数 --refresh-entities 临时开启）
+    refresh_entities: false
+    # 实体映射文件路径（相对项目根目录）
+    entity_mapping_path: test_suite/dataqa/entity_mapping.json
+    # 触发填充的数据集路径片段：用例源 CSV 路径包含任一片段即启用填充
+    target_dirs:
+      - dataqa
+    # 填充后数据集输出目录（保留原文件名，已存在同名文件时覆盖）；
+    # 该目录会被嗅探扫描排除，保证未填充/已填充数据集严格隔离
+    output_dir: test_suite/dataqa/filled/
 
 # 业务平台登录配置
 business_platform:
   login_url: "https://pmms01-test.rundoai.com/api/system/login"
   username: "your_username"
   password: "your_password"
+  # 业务平台 API 基础地址（业务接口调用客户端使用，置顶接口实施时启用）
+  # api_base_url: "https://pmms01-test.rundoai.com"
+  # 设备信息采集（接口 /api/device/basic-list-page）：每类设备采集条数（可配置）
+  device_page_size: 10
 
 result:
   save_path: result/
+  write_batch_size: 20  # 每批完成评价后落盘的用例数，10–30；多轮父用例计 1 条

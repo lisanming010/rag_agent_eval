@@ -17,27 +17,32 @@
 │   └── runner.py                  # 评测执行器（evaluate 调用 + 重试 + 结果回写）
 ├── pipeline/                      # 流水线模块
 │   ├── __init__.py                # 包初始化
-│   └── test_case_loader.py        # 测试用例加载器（CSV 解析 → 用例列表）
-├── result/                        # 评测结果输出目录                 
-├── test/                          # 测试数据集存放目录
-│   ├── test_cases_normal.csv      # 基础测试集
-│   ├── test_cases_hallucination.csv  # 幻觉测试集
-│   ├── test_cases_inference.csv   # 推理测试集
-│   ├── test_cases_retrieval.csv   # 检索测试集
-│   ├── test_cases_robustness.csv  # 鲁棒性测试集
-│   └── test_cases_multiturn.csv   # 多轮对话测试集
+│   ├── test_case_loader.py        # 测试用例加载器（CSV 解析 → 用例列表）
+│   ├── resume.py                  # 恢复预检、历史筛选、多轮 tmp 还原
+│   └── placeholder_filler.py      # 占位符填充器（[xxx] → 实体/时间值）
+├── result/                        # 评测结果输出目录
+├── test_suite/                    # 测试数据集存放目录
+│   ├── dataqa/
+│   │   ├── dataqa_raw/            # DataQA 待填充模板（含 [xxx] 占位符）
+│   │   ├── test_cases_*.csv       # 填充后可执行数据集（评测数据）
+│   │   └── entity_mapping.json    # 实体映射（业务平台采集 / 手工维护）
+│   ├── pvassistant/               # PVAssistant 测试集
+│   └── diagnosis/                 # Diagnosis 测试集
 ├── tool/                          # 工具模块
 │   ├── __init__.py                # 工具模块导出
 │   ├── async_result_writer.py     # 异步结果写入器
+│   ├── business_platform_client.py # 业务平台 API 客户端（采集实体映射）
+│   ├── business_platform_token_manager.py # 业务平台登录 token 管理
 │   ├── collection_result.py       # 结果统计分析工具
 │   ├── concurrency.py             # 通用线程池调度
 │   ├── config_reader.py           # 配置读取工具（单例）
 │   ├── csv_reader.py              # CSV 读取工具
 │   ├── csv_writer.py              # CSV 写入工具
+│   ├── result_checkpoint.py       # 批次提交、checkpoint 校验与只读恢复
 │   ├── file_utils.py              # 通用文件系统工具
-│   ├── markdown_writer.py         # Markdown 报告输出
-│   ├── playwright_login.py        # Playwright 登录工具
+│   ├── markdown_writer.py         # Markdown 报告输出（含 seed 记录）
 │   └── get_bad_cases.py           # 失败用例提取工具
+├── docs/                          # 项目文档
 ├── .env.example                   # 环境变量示例
 ├── config.yaml.example            # 配置文件示例
 ├── config.yaml                    # 项目配置
@@ -52,19 +57,24 @@
 主流程位于 [main.py](main.py),执行过程如下:
 
 1. **读取配置**: 解析命令行参数和 [config.yaml](config.yaml) 配置
-2. **加载测试集**: 从指定路径或默认目录加载 CSV 测试集
-3. **并发调用 Agent**: 使用线程池并发调用待测 Agent,获取回答
-4. **组装测试用例**: 将测试样本组装成 `deepeval` 的 `LLMTestCase`
-5. **执行评测**: 根据配置的指标执行异步并发评测
-6. **异步写入结果**: 评测完成后立即异步写入 CSV,不阻塞下一轮测试
-7. **统计分析**: 所有测试完成后,统计各指标的成功率并输出报告
+2. **（可选）刷新实体映射**: 配置 `refresh_entities: true` 或传 `--refresh-entities` 时,
+   登录业务平台采集实体数据,更新 `entity_mapping.json`
+3. **占位符填充**: 嗅探模式下先扫描 raw 模板（`target_dirs` 命中）填充并输出到
+   `output_dir`,再加载可执行数据集;`-cp` 指定模板文件时在加载后直接填充
+4. **加载测试集**: 从指定路径或默认目录加载 CSV 测试集
+5. **并发调用 Agent**: 使用线程池并发调用待测 Agent,获取回答
+6. **组装测试用例**: 将测试样本组装成 `deepeval` 的 `LLMTestCase`
+7. **执行评测**: 根据配置的指标执行异步并发评测
+8. **批次提交结果**: 每批评价完成后由写入线程保存 CSV 并提交 checkpoint，确认成功再开始下一批
+9. **统计分析**: 所有测试完成后,统计各指标的成功率并输出报告（含占位符填充 seed）
 
 ## 主要模块说明
 
 ### 1. 入口脚本 ([main.py](main.py))
 
-- 定义命令行参数 `--csv_path`、`--metrics`
-- 支持单个 CSV 文件评测或批量评测
+- 定义命令行参数 `--csv_path`、`--metrics`、`-a`、`--seed`、`--fill-preview`、`--refresh-entities`、`--resume`、`--resume-result-dir`
+- 支持单个 CSV 文件评测、目录嗅探批量评测、断点重入（`--resume`）
+- 多 Agent 架构：按配置的 enabled 类（PVAssistant / Diagnosis / DataQA）分组执行
 - 使用线程池并发执行 Agent 调用
 - 调用 `deepeval.evaluate()` 执行评测
 - 使用 `AsyncResultWriter` 异步写入结果
@@ -180,30 +190,154 @@ ANTHROPIC_AUTH_TOKEN="your-anthropic-api-key"
 
 ## 使用方式
 
-### 使用默认测试集执行
+### 全流程自动评测（嗅探模式）
 
 ```bash
 pipenv run python main.py
 ```
 
+不指定 `-cp` 时按 `dataset.default_dataset_path` 嗅探各 enabled 类子目录的
+`test_cases_*.csv`。启用占位符填充时,先扫描 raw 模板（`target_dirs` 命中）填充并
+输出到 `output_dir`,再评测生成的可执行数据集。
+
 ### 指定测试集与指标执行
 
 ```bash
 pipenv run python main.py \
-  --csv_path test_suite/test_cases_base.csv \
-  --metrics reverse_validation contextual_recall
+  --csv_path test_suite/dataqa/dataqa_raw/test_cases_direct_inquiry.csv \
+  --metrics dataqa_capability dataqa_params
+```
+
+### 填充预览（只替换不评测）
+
+```bash
+pipenv run python main.py --fill-preview \
+  --csv_path test_suite/dataqa/dataqa_raw/test_cases_direct_inquiry.csv
 ```
 
 ### 参数说明
 
 - `--csv_path` / `-cp`
   - 指定单个 CSV 测试文件
-  - 不传时使用配置中的默认路径
+  - 不传时使用配置中的默认路径（嗅探模式）
 
 - `--metrics` / `-m`
-  - 可选值:`reverse_validation`、`contextual_recall`
-  - 指定了 `--csv_path` 时,该参数必传
+  - 正常评测指定 `--csv_path` 时必传（agent-only 除外）
+  - resume 优先使用 `-m`，否则读取 tmp meta 中的 metrics，最后使用配置兜底；仍缺失则报错
   - 新增 metric 需要在 [evaluator/metrics.py](evaluator/metrics.py) 注册并在 main.py 中完成映射
+
+- `-a` / `--agent_classes`
+  - 指定调用的 agent 类名,支持多个（如 `-a Diagnosis`、`-a PVAssistant DataQA`）
+  - 正常评测不传时使用配置中 `enabled: true` 的类
+  - resume 不传时扫描标准目录下有 tmp 的已注册 Agent，不受 enabled 限制；指定时忽略名称大小写
+
+- `--seed N`
+  - 占位符填充随机种子;不传则随机生成并输出到日志和评测报告
+  - 同一 seed + 同一模板重跑可复现相同测试数据
+
+- `--fill-preview`
+  - 仅执行占位符填充,产物输出到 `placeholder_fill.output_dir`,不执行评测
+
+- `--refresh-entities`
+  - 填充前先登录业务平台更新 `entity_mapping.json`（登录/接口失败时中断）
+  - 与配置项 `placeholder_fill.refresh_entities` 取 OR
+
+- `--resume`
+  - 从 tmp 中间文件恢复评测,跳过 Agent 调用阶段
+  - 不重新填充,seed 从 tmp meta.json 读取并输出到报告
+  - 不指定历史目录时，全量重新评价所选范围内可评价用例，不读取历史结果
+  - 不能与 `--fill-preview` 同时使用
+
+- `--resume-result-dir`
+  - 可选，仅与 `--resume` 配合：指定一个 `result/<时间戳>` 目录，校验 checkpoint 并复用通过结果
+  - 不自动寻找最新目录；路径不存在、非目录或为空时立即报错
+
+### 恢复评价：全量重评与增量恢复
+
+```powershell
+# 从 tmp 全量重新评价：不读取任何历史 CSV 或 checkpoint
+python .\main.py --resume -a Diagnosis
+
+# 增量恢复：将下面的时间戳替换为实际已存在的结果目录
+python .\main.py --resume -a Diagnosis --resume-result-dir ".\result\<时间戳>"
+
+# 只恢复一个标准 Agent 目录或其中一份 tmp 文件
+python .\main.py --resume -cp ".\test_suite\diagnosis" --resume-result-dir ".\result\<时间戳>"
+python .\main.py --resume -cp ".\test_suite\diagnosis\tmp\test_cases_pekat_en_tmp.csv" --resume-result-dir ".\result\<时间戳>"
+```
+
+只支持以下标准目录（`test_suite` 对应 `dataset.default_dataset_path`）：
+
+```text
+test_suite/<agent>/tmp/test_cases_<数据集>_tmp.csv
+test_suite/<agent>/tmp/test_cases_<数据集>_tmp.meta.json
+result/<时间戳>/<agent>/result_outputs_<数据集>.csv
+result/<时间戳>/<agent>/result_outputs_<数据集>.checkpoint.json
+```
+
+不递归扫描人工临时目录、备份或旧式平铺结果。`-cp` 保留实际 Agent 归属，不再归入
+`default`；同时传 `-a` 时必须且只能指定同一个 Agent。历史结果只在所选 Agent 的
+同名目录内寻找，不跨 Agent 回退。未选择的 Agent、其他数据集不会因缺 checkpoint 阻断本次恢复。
+
+数据集以 tmp 的标准文件名及 meta/`_source_csv` 对应，原始测试集即使已移动也不要求
+仍然存在；来源文件名冲突则报错。用例优先按 `test_id`、`用例编号`、`case_id`、`id`
+（多轮也支持父用例编号）对应；缺少编号时按 query 对应，不新增 query 重复检查。
+匹配后还会比对语言及实际评价输入，不复用错配或已经改变输入的旧结论。
+
+增量恢复在组装用例和调用模型前，先完成所选数据集的历史预检：
+
+| 历史状态 | 行为 |
+| --- | --- |
+| CSV、checkpoint 都不存在 | 视为尚无历史结果，从 tmp 正常评价 |
+| CSV 存在、checkpoint 缺失 | 旧格式不兼容，fast fail；可不传历史目录进行全量重新评价 |
+| 有合法的 0 条提交 checkpoint | 尚无可信结果，包括首批写入中断的情况，重新评价 |
+| 非零 checkpoint，但 CSV 缺失、记录不足或摘要不符 | fast fail，不猜测修复 |
+| checkpoint 已提交范围之后有尾部内容 | 不采纳尾部，对应 tmp 用例重新评价，不修改历史文件 |
+| 匹配且可信的历史 `is_success=True` | 复用，不进入用例组装和评价 |
+| 历史未通过、整体状态为空或无匹配记录 | 使用 tmp 输入重新评价 |
+
+是否通过只看最终 `is_success`，不根据 `evaluate_error`、单项指标或复核模型状态另行
+推翻整体结论。评价口径与其他约定条件的一致性由用户保证，不进行配置指纹校验。
+
+多轮 tmp 中的 `(tN)` 字段会反向还原为各轮用例；整体未通过时重评整个父用例，
+不只重评失败轮。任一轮所需响应为空/缺失时，整个父用例跳过评价模型，保留原始内容、
+缺失轮次错误和整体 `is_success=False`；其余轮次不伪造评价结论。单轮缺失响应同样跳过。
+DataQA 使用其结构化响应字段，检索轨使用保存的检索结果，不重新请求 Agent 或检索服务。
+
+如果所选 tmp 用例全部有可信的通过结果，仅提示“全部通过，无需恢复评价”并退出，
+不创建新结果目录、CSV、checkpoint 或报告。否则，新结果包含“复用通过记录 + 本次重评结果 + 不可评价失败记录”，
+统计和报告覆盖本次完整输入范围。全部不可评价不等于全部通过，
+仍会保存失败结果。复用记录不消耗模型请求，后续追加不会覆盖它们或重复保留历史失败行。
+
+新运行使用独立目录，同秒重名自动增加后缀；历史结果与输入 tmp 保持不变。
+
+### 仅调用 Agent（agent-only）
+
+在目标 Agent 的 `class_config` 下开启 `is_agent_only`：
+
+```yaml
+agents:
+  http_agent:
+    class_config:
+      Diagnosis:
+        enabled: true
+        is_agent_only: true
+```
+
+然后按正常入口执行：
+
+```bash
+pipenv run python main.py -a Diagnosis
+```
+
+该模式会完成 Agent 调用并将响应写入测试数据集同级的 `tmp/` 目录，随后跳过
+LLMTestCase 组装、评测、结果目录与报告生成。`--resume` 不受该配置影响，仍用于从
+已有 tmp 中间文件恢复评测。agent-only 不依赖评测指标：指定单个 CSV 时可以省略
+`-m/--metrics`，目录嗅探时也不要求该数据集存在 `dataset_metrics_map` 映射。
+
+```bash
+pipenv run python main.py -a Diagnosis -cp path/to/test_cases_diagnosis.csv
+```
 
 ## 配置说明
 
@@ -262,16 +396,211 @@ dataset:
       - contextual_recall
 ```
 
+### 占位符填充配置
+
+```yaml
+dataset:
+  placeholder_fill:
+    enabled: true                          # 是否执行占位符替换
+    refresh_entities: false                # 是否在替换前刷新实体映射表（登录/接口失败中断）
+    entity_mapping_path: test_suite/dataqa/entity_mapping.json
+    target_dirs:                           # raw 模板目录路径片段（命中即参与填充）
+      - dataqa_raw
+    output_dir: test_suite/dataqa          # 填充产物输出目录（原文件名，同名覆盖）
+```
+
+### 业务平台配置（实体采集）
+
+```yaml
+business_platform:
+  login_url: "https://pmms01-test.rundoai.com/api/system/login"
+  username: "your_username"
+  password: "your_password"
+  api_base_url: "https://pmms01-test.rundoai.com"
+  device_page_size: 10   # 每类设备采集条数
+```
+
 ### 结果保存配置
 
 ```yaml
 result:
   save_path: result/  # 结果输出目录
+  write_batch_size: 20  # 每批落盘的用例数，整数 10–30，未配置默认 20
 ```
+
+评价阶段按批执行：每批完成各指标评价、失败重试和多模型复核后，立即写入结果 CSV，
+确认 CSV 和 checkpoint 均提交成功再开始下一批；最后不足一批的结果也会写入。批内仍使用原有并发配置。
+多轮用例按父用例计为 1 条，整组处理后合并输出，不拆散到不同批次。
+各轮通过状态和错误信息保持独立，整体状态单独记录为 `_parent_all_pass`；
+合并结果的 `is_success` / `用例是否通过` 取整体状态，任一轮未通过则整条用例未通过。
+终端会显示当前批次范围、累计已落盘条数及 checkpoint 提交事件；结果 CSV 命名保持不变。
+
+后续批次新增的错误、重试或复核字段会自动补入表头，旧行对应列留空；
+仅表头扩展时重写已有内容，普通批次直接追加。写入失败会中止评价并报错。
+正常评价、全量重新评价和增量恢复的结果写入，均自动维护同名 `.checkpoint.json`。
+仅 Agent 响应的 tmp 和报告派生的 `bad_cases_*.csv` 不属于评价提交文件，不生成该检查点。
+
+checkpoint 包含 `version`、`result_file`、`agent`、`last_committed_batch`、`committed_rows`、
+`last_case_id`、`committed_columns`、`content_sha256`。其中记录数不含表头，多轮合并后算一条；
+最后一个编号只辅助排查，不能替代内容校验。批次完整不代表其中每条用例都通过。
+
+写入顺序为 **CSV 写入并同步 → checkpoint 临时文件写入并同步 → 原子替换 checkpoint**。
+首次写入前先建立 0 条提交检查点。CSV 已写入但 checkpoint 未提交成功时，该批不能复用，
+同时停止后续评价。恢复只读取已确认的完整范围，不截断历史文件。
+
+摘要按已提交字段的字符串值和逻辑 CSV 记录计算，支持带换行的大字段，不按物理行数或
+单纯字节偏移判断完整性。普通追加增量计算摘要；表头扩展时重建摘要。若扩展表头后提交中断，
+仍可按旧 checkpoint 的字段集合验证旧记录，新字段与未提交尾部不被采纳。
+
+## 占位符填充（Placeholder Fill）
+
+评测执行前,将测试数据集中的 `[xxx]` 占位符替换为真实值,使同一份模板数据集可反复
+生成不同的可执行数据集。实现位于 [pipeline/placeholder_filler.py](pipeline/placeholder_filler.py)。
+
+### 目录结构
+
+```text
+test_suite/
+└── dataqa/
+    ├── dataqa_raw/          ← 待填充模板（含占位符，不可直接执行）
+    │   └── test_cases_direct_inquiry.csv
+    ├── test_cases_*.csv     ← 填充后可执行数据集（output_dir 产物，评测数据）
+    └── entity_mapping.json  ← 实体映射（业务平台采集 / 手工维护）
+```
+
+### 占位符类型
+
+| 类型 | 示例 | 处理方式 |
+|---|---|---|
+| 实体类 | `` `[电站]` ``、`` `[逆变器设备SN]` `` | 从 entity_mapping.json 按映射表随机抽取 |
+| 时间类 | `` `[今天起始]` ``、`` `[本月起始]` ``、`` `[3天前起始]` `` | 基于执行当天动态计算（`%Y-%m-%d %H:%M:%S`） |
+| 监控项类 | `[直流电压1,当日发电量]`、`[全部监控项]` | 普通文本（非占位符），裸写原样保留（detailList 参数值） |
+
+占位符标识为反引号包裹的 `` `[电站]` `` 形式，替换时反引号一并去除；
+裸 `[电站]` 是普通文本，不参与替换（如 `detailList=[直流电压1,当日发电量]` 参数值裸写即可）。
+
+### 时间占位符
+
+时间占位符分为固定写法和泛化写法两类，基于执行当天动态计算，统一输出格式
+`%Y-%m-%d %H:%M:%S`。整个填充过程只捕获一次执行时刻作为基准，全数据集
+（query 与 expected_parameters）共用。
+
+下表 token 省略反引号标识，实际书写需以 `` `[xxx]` `` 反引号包裹形式才被识别。
+
+| 占位符 | 计算结果 | 说明 |
+|---|---|---|
+| `[今天起始]` | 今天 00:00:00 | |
+| `[今天结束]` | 今天 23:59:59 | 明天 00:00:00 减 1 秒 |
+| `[本月起始]` | 本月 1 号 00:00:00 | |
+| `[本月结束]` | 本月最后一天 23:59:59 | 下月 1 号减 1 秒 |
+| `[今年起始]` | 今年 1 月 1 日 00:00:00 | |
+| `[今年结束]` | 今年 12 月 31 日 23:59:59 | |
+| `[上月起始]` | 上月 1 号 00:00:00 | 本月 1 号减 1 天再取 1 号 |
+| `[上月结束]` | 上月最后一天 23:59:59 | 本月 1 号减 1 秒 |
+| `[去年起始]` | 去年 1 月 1 日 00:00:00 | |
+| `[去年结束]` | 去年 12 月 31 日 23:59:59 | |
+| `[3天前起始]` | 今天 − 3 天 00:00:00 | 天边界，非执行时刻 −72h |
+| `[7天前起始]` / `[一周前起始]` | 今天 − 7 天 00:00:00 | 两个写法等价 |
+| `[24小时前]` | 执行时刻 −24h | 唯一滚动窗口 token，保留时分秒 |
+| `[当前时刻]` | 执行时刻 | 保留时分秒 |
+
+泛化写法（N 为数字，可含 0；单位必须是"个月"，`[3月前起始]` 不识别）：
+
+| 写法 | 计算结果 | 说明 |
+|---|---|---|
+| `[N天前起始]` | 今天 − N 天 00:00:00 | 天边界，非执行时刻 −N×24h |
+| `[N天前结束]` | 今天 − N 天 23:59:59 | |
+| `[N个月前起始]` | 今天 − N 个月（同日）00:00:00 | 日历语义；日号超过目标月最后一天时钳制（如 3-31 减 1 个月 → 2-28/29） |
+| `[N个月前结束]` | 同上 23:59:59 | |
+| `[N年前起始]` | 今天 − N 年（同月同日）00:00:00 | 闰日钳制（2-29 减 1 年 → 2-28） |
+| `[N年前结束]` | 同上 23:59:59 | |
+
+`[3天前起始]` / `[7天前起始]` 固定写法与 `[N天前起始]` 泛化写法结果一致。
+
+匹配规则：
+
+- **标识为反引号包裹的 `` `[xxx]` ``**：只有反引号包裹的 token 才被识别替换，
+  替换时反引号一并去除；裸 `[xxx]` 是普通文本，不识别、不报错、原样保留
+- **固定写法精确全等匹配**：token 必须与白名单完全一致（如 `[3天前]` 不在白名单内）
+- **泛化写法模式匹配**：`[N天前起始/结束]`、`[N个月前起始/结束]`、`[N年前起始/结束]`
+  支持任意数字 N（如 `[5天前起始]`、`[2个月前结束]`）；带"起始"/"结束"之外后缀的
+  写法（如 `[2周前起始]`、`[3月前起始]`、不带边界的 `[N天前]`）不识别
+- **未识别 fail fast**：反引号包裹但内容不识别（非时间、非实体）
+  即中断，携带文件、行号、列名报错；裸 `[xxx]` 不触发 fail fast
+- **"起始"/"结束"语义**：起始类取边界 00:00:00，结束类取边界 23:59:59；
+  仅 `[24小时前]` / `[当前时刻]` 为精确到秒的滚动时刻
+- **与参数键无关**：时间 token 的值不随所在参数键变化（实体 token 才按参数键
+  取不同字段），query 与 expected_parameters 中同一 token 填出同一值
+- **seed 复现例外**：`[当前时刻]` / `[24小时前]` 按执行时刻计算，同 seed 重跑
+  仍存在秒级差异；其余 token（含泛化写法）只依赖日期，同一天内可复现
+
+### 实体映射表
+
+query 取人可读字段,`expected_parameters` 按参数键取接口期望字段:
+
+| 占位符 | 数据源分类 | query 取值 | params 取值（按参数键） |
+|---|---|---|---|
+| `[电站]` | 电站 | `name` | `siteId/powerStationId/ids/siteIds/stationId` → `id` |
+| `[项目]` | 项目 | `name` | `settlementOrganizationId` → `id` |
+| `[大区/省]` | 电站 | `provinceCityDistrict` 第1段 | 同左（`area`） |
+| `[大区/省-州/市]` | 电站 | 前2段 | 同左 |
+| `[大区/省-州/市-区]` | 电站 | 全量 | 同左 |
+| `[地址]` | 电站 | `provinceCityDistrict` 全量（近似） | 同左（`address`） |
+| `[逆变器设备SN]` | Inverter | `deviceSn` | `deviceSn/externalId_like` → `deviceSn`；`deviceId` → `id` |
+| `[逆变器设备ID]` | Inverter | `id` | `deviceId` → `id` |
+| `[逆变器设备名称]` | Inverter | `name` | `deviceName_like` → `name` |
+| `[气象站设备SN]` | MeteorologicalStation | `deviceSn` | `deviceSn`；`deviceId` → `id` |
+| `[气象站设备ID]` | MeteorologicalStation | `id` | `deviceId` → `id` |
+| `[执行人]` | 消缺工单/消缺记录/巡检工单 | `chargePerson` → `chargePersonName` | `chargePersonId` → `chargePersonId` |
+| `[整改人]` | 隐患工单 | `rectifyPersonName` | `rectifyPersonId` → `rectifyPersonId` |
+| `[修改人]` | 低效告警白名单 | `changedBy` | `changedUserId/changedBy` → `changedBy` |
+| `[消缺工单编号]` | 消缺工单 | `id` | `number` → `id` |
+| `[巡检工单编号]` | 巡检工单 | `id` | `number` → `id` |
+| `[消缺记录工单编号]` | 消缺记录 | `id` | `number` → `id` |
+
+### 随机与一致性规则
+
+- **每行独立随机**: 不同用例行抽取不同实体（同 seed 可复现）
+- **行内一致性**: 同一行内相同 token 用同一记录;同一分类复用同一记录
+  （如 `[逆变器设备SN]`/`[逆变器设备ID]`/`[逆变器设备名称]` 指向同一台设备,
+  `[执行人]` 与 `[消缺工单编号]` 来自同一条工单）
+- **锚定+关联抽取**: 行内出现 `[电站]` 时作为锚实体,其余实体优先从锚的关联记录
+  中抽取（外键: `powerStationIds` / `siteId` / `stationId` / `powerStationId` /
+  `deviceId`）;锚下无关联记录时降级全局随机并输出 warning
+- **seed 可复现**: 同一 seed 重跑实体抽取完全一致（`[当前时刻]`/`[24小时前]` 按
+  执行时刻计算,存在秒级差异）;seed 输出到评测报告标题区,`--resume` 时从
+  tmp meta.json 读取保持一致
+
+### 异常处理
+
+| 场景 | 行为 |
+|---|---|
+| 反引号包裹但未识别的占位符（非实体、非时间） | **fail fast 中断**,报错含 token、文件、行号、用例编号、列名 |
+| 实体映射文件缺失/格式错误 | 中断,提示检查 `entity_mapping_path` |
+| `--refresh-entities` 登录或接口失败 | **中断执行**（不静默回退旧映射） |
+| 锚定关联无匹配记录 | 降级全局随机 + warning（不中断） |
+| 已填充产物被指定为填充输入（-cp output_dir 文件） | 拒绝并提示指定 raw 模板 |
+| 嗅探 output_dir 内的产物 | 自动跳过（不二次填充、不重复评测） |
+
+### 实体映射刷新
+
+`--refresh-entities` 或 `refresh_entities: true` 时,填充前调用
+`BusinessPlatformClient().export_entity_mapping()` 更新实体映射:
+
+- 采集内容: 电站/项目、设备（Inverter/气象站）、消缺工单、消缺记录、巡检工单、
+  隐患工单、低效告警白名单
+- 已存在的手工分类（区域/地址等）保留,仅更新采集到的分类
+- 也可独立执行: `python -m tool.business_platform_client --export-mapping`
 
 ## 测试集格式
 
 测试集命名规则:`test_cases_*.csv`,必须以 `test_cases_` 开头且为 CSV 格式。
+
+Diagnosis 数据集可通过 `language` 列指定响应语言：`zh-CN` 或 `en-US`。调用时该值会写入
+请求头 `Language`；列缺失或值为空时默认使用 `zh-CN`。
+Diagnosis 默认使用 `response_mode=streaming`，客户端从 SSE 的
+`complete.data.content` 提取最终文本并写入用例的 `agent_response` 字段；同时保留普通
+JSON 响应兼容。
 
 ### 单轮对话测试集
 

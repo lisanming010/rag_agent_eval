@@ -118,7 +118,7 @@ class MRRMetric(BaseMetric):
         for ex in expected:
             ex = ex.strip()
             for rank, item in enumerate(retrieved, start=1):
-                if item in ex:
+                if ex in item:
                     curr_score = 1 / rank
                     if curr_score > self.score:
                         self.score = curr_score
