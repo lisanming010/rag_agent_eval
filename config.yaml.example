@@ -69,12 +69,14 @@ metric_conf:
 
 # 评价器配置
 evluate:
-  # 是否启用异步并发
+  # False 时有效并发为 1，仍直接使用指标异步接口
   run_async: True
-  # 最大并发数量
+  # 主评、复核、结构化与重试共用的指标执行并发上限
   max_concurrent: 10
-  # 提交间隔s
+  # 所有指标尝试共用的启动间隔（秒）
   throttle_value: 1
+  # 单次指标 a_measure 超时（秒），不包含排队与重试退避
+  metric_timeout: 180
 
 dataset:
   # 测试用例集存放路径，可以指定文件夹也可以指定具体某个测试用例集csv文件
@@ -140,4 +142,4 @@ business_platform:
 
 result:
   save_path: result/
-  write_batch_size: 20  # 每批完成评价后落盘的用例数，10–30；多轮父用例计 1 条
+  write_batch_size: 20  # 持续评价中累计终态结果的落盘批量，10–30；多轮父用例计 1 条

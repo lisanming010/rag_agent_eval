@@ -1,4 +1,5 @@
 import argparse
+import asyncio
 import json
 import os
 import re
@@ -22,7 +23,7 @@ from agents.factory import create_agent, get_enabled_classes, is_agent_only_enab
 from pipeline.test_case_loader import make_test_case_list, make_tmp_test_case_list
 from pipeline.resume import prepare_resume
 from pipeline.placeholder_filler import fill_test_cases, fill_raw_datasets, preview_fill
-from evaluator.runner import run_evaluate, run_evaluate_structured, run_multimodel_reevaluate, recompute_overall_success
+from evaluator.runner import evaluate_groups
 
 logger = LogFactory.get_logger(__name__)
 
@@ -435,7 +436,7 @@ def _parse_turns(case_row: dict) -> list[tuple[int, str, str]]:
 def call_multi_turn_agent(agent, case_row: dict) -> list[dict]:
     """
     处理一条多轮用例：共享 session_id，严格按轮次串行调用 agent，
-    每轮返回一条子行 dict，格式对齐单轮用例方便后续复用 make_llm_case / run_evaluate。
+    每轮返回一条子行 dict，格式对齐单轮用例，供 make_llm_case 与逐例评价复用。
 
     :return: N 条子行列表，每条包含 query, agent_response, expected_behavior, _turn 等
     """
@@ -1147,47 +1148,48 @@ class EvaluationPipeline:
                     if has_multi_turn:
                         baseline = [_normalize_single_turn_fields(row) if not row.get('_parent_case_id')
                                     else row for row in baseline]
-                    total = len(groups) + len(baseline)
-                    # 复用记录和不可评价记录不进入任何评价函数，但同样完整提交。
-                    for start in range(0, len(baseline), batch_size):
-                        saved = baseline[start:start + batch_size]
-                        writer.submit({'csv': saved}, test_case['case_name'], append=bool(completed_rows))
-                        writer.flush()
-                        completed_rows.extend(saved)
-                    for offset in range(0, len(groups), batch_size):
-                        rows = [row for group in groups[offset:offset + batch_size]
-                                for row in group]
+                    buffer = []
+
+                    async def submit_ready(*, tail=False):
+                        while len(buffer) >= batch_size or (tail and buffer):
+                            saved = buffer[:batch_size]
+                            await writer.submit_async(
+                                {'csv': saved}, test_case['case_name'], append=bool(completed_rows))
+                            del buffer[:len(saved)]
+                            completed_rows.extend(saved)
+
+                    async def receive(rows):
                         batch = {**test_case, 'csv': rows}
-                        logger.info(
-                            f"[阶段3] {test_case['case_name']} "
-                            f"评价第 {offset + 1}–{min(offset + batch_size, len(groups))}/{len(groups)} 条"
-                        )
-                        # 无有效评价结果时不得残留输入中的旧整体通过标志。
-                        for row in rows:
-                            row['is_success'] = False
-                        run_evaluate(batch)
-                        run_evaluate_structured(batch)
-                        # 初评只写指标结果，复核筛选前须先汇总本轮通过状态。
-                        recompute_overall_success(batch)
-                        run_multimodel_reevaluate(batch)
-                        # 先汇总复核后的每轮状态，再独立计算父用例整体状态。
-                        recompute_overall_success(batch)
-                        for row in rows:
-                            row['用例是否通过'] = row.get('is_success') is True
                         _aggregate_multi_turn(batch)
-                        output_rows = _merge_multi_turn_rows(batch['csv'],
-                                                             normalize_single_turn=True)
-                        # 混合数据集中，即使本批全是单轮，也须沿用整表 (t1) 列格式。
-                        if has_multi_turn and not any(r.get('_parent_case_id') for r in batch['csv']):
+                        output_rows = _merge_multi_turn_rows(rows, normalize_single_turn=True)
+                        if has_multi_turn and not any(r.get('_parent_case_id') for r in rows):
                             output_rows = [_normalize_single_turn_fields(r) for r in output_rows]
-                        batch['csv'] = output_rows
-                        writer.submit(batch, test_case['case_name'], append=bool(completed_rows))
-                        # 明确的落盘边界：写入失败时停止，不继续消耗模型请求。
-                        writer.flush()
-                        completed_rows.extend(output_rows)
-                        logger.info(
-                            f"[阶段3] {test_case['case_name']} 已落盘 {len(completed_rows)}/{total} 条"
-                        )
+                        buffer.extend(output_rows)
+                        await submit_ready()
+
+                    async def run_dataset():
+                        try:
+                            # 复用与不可评价记录不进入评价，但同样进入新结果基线。
+                            for row in baseline:
+                                buffer.append(row)
+                                await submit_ready()
+                            if baseline:
+                                await submit_ready(tail=True)
+                                await asyncio.to_thread(writer.flush)
+                            if groups:
+                                await evaluate_groups(
+                                    groups, test_case['metrics'], receive, conf=self.conf,
+                                    check_health=writer.check_health, write_stats=writer.get_stats,
+                                    label=f"评价 {test_case['case_name']}",
+                                )
+                        finally:
+                            # 正常结束/软中断排空完整终态。写入失败由 health check 直接中止。
+                            await submit_ready(tail=True)
+
+                    asyncio.run(run_dataset())
+                    # 数据集收尾才等待 checkpoint；评价过程中不再逐批 flush。
+                    writer.flush()
+                    logger.info(f"[阶段3] {test_case['case_name']} 已提交 {len(completed_rows)} 条")
                     test_case['csv'] = completed_rows
             finally:
                 # 评价异常/用户中断时，也收尾已提交批次。

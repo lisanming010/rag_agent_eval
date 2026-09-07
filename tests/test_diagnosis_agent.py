@@ -113,3 +113,115 @@ def test_diagnosis_rejects_unsupported_language(monkeypatch):
         agent.call_agent('fault code 122', language='en-GB')
 
     assert called is False
+
+
+def _response_with_content(content, mode='blocking'):
+    if mode == 'blocking':
+        response = _SuccessfulResponse()
+        response.json = lambda: {'content': {'data': {'markdown': content}}}
+    else:
+        response = _SseResponse()
+        # 拆开标签，覆盖仅有 delta 时拼接完整响应后再解析的路径。
+        response._lines = [
+            'data: ' + json.dumps({
+                'event_type': 'delta', 'data': {'contentDelta': part},
+            })
+            for part in (content[:4], content[4:])
+        ]
+    return response
+
+
+@pytest.mark.parametrize('mode', ['blocking', 'streaming'])
+@pytest.mark.parametrize('model', ['SG40CX', 'SG40CX-P2', 'SG40CX-p2'])
+@pytest.mark.parametrize('session_id', [None, 'existing-session'])
+def test_diagnosis_selects_exact_model_and_reuses_session(monkeypatch, mode, model, session_id):
+    options = [
+        f'{i}. MPPT Reverse Connection (Device (Inverter), Manufacturer (Sungrow), Model ({value}))'
+        for i, value in enumerate(['SG40CX-P2', 'SG40CX-p2', 'SG40CX'], 1)
+    ]
+    first = '\n&#x20;\n'.join(f'<suggest>{option}</suggest>' for option in options)
+    responses = iter([_response_with_content(first, mode), _response_with_content('最终诊断', mode)])
+    requests = []
+
+    def fake_post(url, data, headers, **kwargs):
+        requests.append((json.loads(data), headers, kwargs))
+        return next(responses)
+
+    monkeypatch.setattr('agents.http_agent.requests.post', fake_post)
+    agent = Diagnosis('https://example.test/chat-messages', 'token')
+    query = f'Sungrow inverter reported fault code 265, model: {model}'
+    _, summary, elapsed = agent.call_agent(
+        query, user='test-user', session_id=session_id, language='en-US', res_mode=mode,
+    )
+
+    assert summary == '最终诊断'
+    assert float(elapsed) >= 0
+    assert len(requests) == 2
+    assert requests[0][0]['query'] == query
+    selected = options[['SG40CX-P2', 'SG40CX-p2', 'SG40CX'].index(model)]
+    assert requests[1][0] == {**requests[0][0], 'query': selected}
+    assert requests[0][1] == requests[1][1]
+    assert requests[0][1]['X-Session-Id']
+    if session_id is not None:
+        assert requests[1][1]['X-Session-Id'] == session_id
+    assert requests[1][1]['Language'] == 'en-US'
+    assert requests[1][0]['user'] == 'test-user'
+    assert requests[1][0]['response_mode'] == mode
+
+
+@pytest.mark.parametrize(('query', 'content'), [
+    ('model: SG40CX', '<suggest>1. Model (SG40CX-P2)</suggest>'),
+    ('model: SG40CX-P2', '<suggest>1. Model (SG40CX)</suggest>'),
+    ('model: SG40CX-p2', '<suggest>1. Model (SG40CX-P2)</suggest>'),
+    ('fault code 265', '<suggest>1. Model (SG40CX)</suggest>'),
+    ('model: ', '<suggest>1. Model (SG40CX)</suggest>'),
+    ('model: SG40CX', '<suggest>1. SG40CX</suggest>'),
+    ('model: SG40CX', '<suggest>1. Model (SG40CX)'),
+    ('model: SG40CX', 'Model (SG40CX)'),
+    ('model: SG40CX', '<suggest>1. Model (SG40CX)</suggest><suggest>2. Model (SG40CX)</suggest>'),
+    ('model: SG40CX, model: SG40CX-P2', '<suggest>1. Model (SG40CX)</suggest>'),
+])
+def test_diagnosis_keeps_first_response_without_unique_match(monkeypatch, query, content):
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        return _response_with_content(content)
+
+    monkeypatch.setattr('agents.http_agent.requests.post', fake_post)
+    raw, summary, _ = Diagnosis('https://example.test/chat-messages', 'token').call_agent(query)
+    assert summary == content
+    assert raw['content']['data']['markdown'] == content
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize('query', ['故障码265，型号是 SG40CX ', '型号：SG40CX', 'model: SG40CX , fault: 265'])
+def test_diagnosis_submits_suggest_text_only_once(monkeypatch, query):
+    content = '<suggest>1. 故障（型号（SG40CX））</suggest>'
+    calls = []
+
+    def fake_post(url, data, **kwargs):
+        calls.append(json.loads(data)['query'])
+        return _response_with_content(content)
+
+    monkeypatch.setattr('agents.http_agent.requests.post', fake_post)
+    _, summary, _ = Diagnosis('https://example.test/chat-messages', 'token').call_agent(query)
+    assert calls == [query, '1. 故障（型号（SG40CX））']
+    assert summary == content
+
+
+def test_diagnosis_propagates_second_request_failure(monkeypatch):
+    calls = []
+
+    def fake_post(*args, **kwargs):
+        calls.append(kwargs)
+        response = _response_with_content('<suggest>1. Model (SG40CX)</suggest>')
+        if len(calls) == 2:
+            response.status_code = 500
+            response.text = 'second request failed'
+        return response
+
+    monkeypatch.setattr('agents.http_agent.requests.post', fake_post)
+    with pytest.raises(RuntimeError, match='second request failed'):
+        Diagnosis('https://example.test/chat-messages', 'token').call_agent('model: SG40CX')
+    assert len(calls) == 2

@@ -155,6 +155,20 @@ def pipeline(tmp_path, monkeypatch, result_dir=None):
     return instance
 
 
+def install_evaluation(monkeypatch, evaluate):
+    from evaluator.runner import recompute_overall_success
+
+    async def fake_groups(groups, metrics, on_result, **kwargs):
+        for rows in groups:
+            kwargs['check_health']()
+            batch = {'csv': rows, 'metrics': metrics}
+            evaluate(batch)
+            recompute_overall_success(batch)
+            await on_result(rows)
+
+    monkeypatch.setattr(evaluation_main, 'evaluate_groups', fake_groups)
+
+
 def forbid(*args, **kwargs):
     pytest.fail('此流程不应被调用')
 
@@ -190,9 +204,7 @@ def test_partial_resume_writes_full_result_and_can_resume_again(tmp_path, monkey
         for row in batch['csv']:
             row['judge_is_success'] = True
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda *a: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', lambda *a: None)
+    install_evaluation(monkeypatch, evaluate)
     instance.run()
     assert assembled == evaluated == ['2', '3']
     new_root = next((tmp_path / 'new').iterdir())
@@ -207,7 +219,7 @@ def test_partial_resume_writes_full_result_and_can_resume_again(tmp_path, monkey
 def test_all_unavailable_still_writes_failure_results(tmp_path, monkeypatch):
     instance = pipeline(tmp_path, monkeypatch)
     monkeypatch.setattr(instance, '_prepare_from_tmp', lambda: {'Diagnosis': [dataset([multi(missing=True)])]})
-    for name in ('make_llm_case', 'run_evaluate', 'run_evaluate_structured', 'run_multimodel_reevaluate'):
+    for name in ('make_llm_case', 'evaluate_groups'):
         monkeypatch.setattr(evaluation_main, name, forbid)
     instance.run()
     output = next((tmp_path / 'new').glob('*/diagnosis/*.csv'))
@@ -313,9 +325,7 @@ def test_full_pipeline_rejudges_previously_passed_input(tmp_path, monkeypatch):
         for row in batch['csv']:
             row['judge_is_success'] = False
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda *a: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', lambda *a: None)
+    install_evaluation(monkeypatch, evaluate)
     instance.run()
     assert calls == ['q1']
     output = next((tmp_path / 'new').glob('*/diagnosis/*.csv'))
@@ -334,9 +344,7 @@ def test_mixed_schema_remains_consistent_when_tmp_now_contains_only_singles(tmp_
         for row in batch['csv']:
             row['judge_is_success'] = True
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda *a: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', lambda *a: None)
+    install_evaluation(monkeypatch, evaluate)
     instance.run()
     output = next((tmp_path / 'new').glob('*/diagnosis/*.csv'))
     rows = read_committed(output, 'Diagnosis').rows
@@ -346,7 +354,7 @@ def test_mixed_schema_remains_consistent_when_tmp_now_contains_only_singles(tmp_
     assert CollectionResult(output).task_success_stats()['judge'] == 100
 
 
-def test_checkpoint_failure_stops_pipeline_before_next_batch(tmp_path, monkeypatch):
+def test_checkpoint_failure_keeps_only_committed_prefix(tmp_path, monkeypatch):
     import tool.result_checkpoint as module
     original = module.atomic_json
 
@@ -366,12 +374,10 @@ def test_checkpoint_failure_stops_pipeline_before_next_batch(tmp_path, monkeypat
         for row in batch['csv']:
             row['judge_is_success'] = True
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda *a: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', lambda *a: None)
+    install_evaluation(monkeypatch, evaluate)
     with pytest.raises(RuntimeError, match='checkpoint second batch failed'):
         instance.run()
-    assert sizes == [10, 10]
+    assert 20 <= len(sizes) <= 25  # 异步写入失败前允许已有在途评价完成
     output = next((tmp_path / 'new').glob('*/diagnosis/*.csv'))
     snapshot = read_committed(output, 'Diagnosis')
     assert len(snapshot.rows) == 10 and snapshot.has_uncommitted_tail
@@ -460,7 +466,7 @@ def test_unavailable_results_generate_real_report_and_bad_cases(tmp_path, monkey
     instance = pipeline(tmp_path, monkeypatch)
     monkeypatch.setattr(instance, '_report', evaluation_main.EvaluationPipeline._report.__get__(instance))
     monkeypatch.setattr(instance, '_prepare_from_tmp', lambda: {'Diagnosis': [dataset([multi(missing=True)])]})
-    for name in ('make_llm_case', 'run_evaluate', 'run_evaluate_structured', 'run_multimodel_reevaluate'):
+    for name in ('make_llm_case', 'evaluate_groups'):
         monkeypatch.setattr(evaluation_main, name, forbid)
     instance.run()
     output = next((tmp_path / 'new').glob('*/diagnosis/result_outputs_*.csv'))
@@ -482,9 +488,7 @@ def test_multiturn_resume_end_to_end(tmp_path, monkeypatch, failed_turn):
         for row in batch['csv']:
             row['judge_is_success'] = row['_turn'] != failed_turn
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda *a: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', lambda *a: None)
+    install_evaluation(monkeypatch, evaluate)
     instance.run()
     assert seen == ['m1', 'm2', 'm3']
     output = next((tmp_path / 'new').glob('*/diagnosis/*.csv'))
@@ -512,9 +516,7 @@ def test_multidataset_and_multiagent_resume_outputs_full_scope(tmp_path, monkeyp
         for row in batch['csv']:
             row['judge_is_success'] = True
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda *a: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', lambda *a: None)
+    install_evaluation(monkeypatch, evaluate)
     instance.run()
     assert assembled == ['2']
     new_root = next((tmp_path / 'new').iterdir())

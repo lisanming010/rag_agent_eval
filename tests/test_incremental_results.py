@@ -1,13 +1,12 @@
 """离线验证评价批次落盘，不调用 Agent 或真实评价模型。"""
 
+import asyncio
 import csv
 import threading
-from types import SimpleNamespace
 
 import pytest
 
 import main as evaluation_main
-import evaluator.runner as evaluation_runner
 import tool.csv_writer as csv_writer_module
 from tool.async_result_writer import AsyncResultWriter
 from tool.csv_writer import CsvWriter
@@ -125,26 +124,21 @@ def make_pipeline(tmp_path, monkeypatch, batch_size=None):
 def install_fake_evaluation(monkeypatch, before_evaluate=None):
     calls = []
 
-    def evaluate(batch):
-        if before_evaluate:
-            before_evaluate(len(calls), batch)
-        calls.append([row['query'] for row in batch['csv']])
-        for row in batch['csv']:
-            row['judge_score'] = 1
-            row['judge_is_success'] = True
-            row['is_success'] = True
+    async def fake_groups(groups, metrics, on_result, **kwargs):
+        for rows in groups:
+            kwargs['check_health']()
+            batch = {'csv': rows}
+            if before_evaluate:
+                before_evaluate(len(calls), batch)
+            calls.append([row['query'] for row in rows])
+            for row in rows:
+                row.update(judge_score=1, judge_is_success=True, is_success=True,
+                           用例是否通过=True, structured_reason='structured complete',
+                           judge_model2_reason='review complete')
+            await on_result(rows)
+            await asyncio.sleep(0)
 
-    def structured(batch):
-        for row in batch['csv']:
-            row['structured_reason'] = 'structured complete'
-
-    def review(batch):
-        for row in batch['csv']:
-            row['judge_model2_reason'] = 'review complete'
-
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', structured)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', review)
+    monkeypatch.setattr(evaluation_main, 'evaluate_groups', fake_groups)
     return calls
 
 
@@ -153,93 +147,35 @@ def dataset(count):
             'csv': [{'query': f'q{i}'} for i in range(count)]}
 
 
-@pytest.mark.parametrize('results,initial_success,expected_queries', [
-    ([(True, True), (True, True)], None, []),
-    ([(True, True), (False, True)], None, ['q1']),
-    ([(True, True), (True, False)], None, ['q1']),
-    ([(True, True), (False, True)], True, ['q1']),
-    ([(True, True), (True, True)], False, []),
-])
-def test_pipeline_reviews_only_failed_initial_evaluations(
-    tmp_path, monkeypatch, results, initial_success, expected_queries,
-):
-    pipeline = make_pipeline(tmp_path, monkeypatch)
-    cases = dataset(len(results))
-    cases['metrics'].append('dataqa_capability')
-    for row in cases['csv']:
-        row['llm_test_case'] = object()
-        if initial_success is not None:
-            row['is_success'] = initial_success
-
-    # 与真实初评相同，只写指标结果，不写整体 is_success。
-    def evaluate(batch):
-        for row, (llm_pass, _) in zip(batch['csv'], results):
-            row['judge_is_success'] = llm_pass
-
-    def structured(batch):
-        for row, (_, structured_pass) in zip(batch['csv'], results):
-            row['DataQA_Capability_is_success'] = structured_pass
-
-    values = {
-        'judge_llm.anthropic.model2': 'reviewer2',
-        'judge_llm.anthropic.model3': 'reviewer3',
-    }
-
-    class Config:
-        def get(self, key, default=None):
-            return values.get(key, default)
-
-    monkeypatch.setattr(evaluation_runner.ConfigReader, 'get_instance', lambda: Config())
-    monkeypatch.setattr(evaluation_runner, 'METRIC_NEEDS_REVIEW', {'reverse_validation'})
-    monkeypatch.setattr(evaluation_runner, 'create_metrics_for_model',
-                        lambda model, metrics: {'judge': SimpleNamespace(__name__='judge')})
-    reviewed = []
-
-    def review_batch(rows, metrics, label, *args):
-        reviewed.append((label, [row['query'] for row in rows]))
-        for row in rows:
-            row[f'judge_{label}_is_success'] = True
-
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', evaluate)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', structured)
-    monkeypatch.setattr(evaluation_runner, '_batch_reevaluate', review_batch)
-
-    pipeline._evaluate({'Diagnosis': [cases]})
-
-    assert reviewed == ([(label, expected_queries) for label in ('model2', 'model3')]
-                        if expected_queries else [])
-
-
 @pytest.mark.parametrize('batch_size,count,expected', [
     (None, 45, [20, 20, 5]), (10, 23, [10, 10, 3]),
     (30, 31, [30, 1]), (20, 3, [3]), (20, 40, [20, 20]),
 ])
-def test_pipeline_persists_completed_batches_before_next_evaluation(
+def test_pipeline_writes_final_results_in_batches(
     tmp_path, monkeypatch, batch_size, count, expected,
 ):
+    import tool.result_checkpoint as checkpoint
     pipeline = make_pipeline(tmp_path, monkeypatch, batch_size)
     path = tmp_path / 'diagnosis' / 'result_outputs_demo.csv'
+    commits = []
+    original = checkpoint.CheckpointWriter.commit
 
-    def before(batch_index, batch):
-        if batch_index:
-            written = read_rows(path)
-            assert len(written) == sum(expected[:batch_index])
-            assert all(row['structured_reason'] == 'structured complete' for row in written)
-            assert all(row['judge_model2_reason'] == 'review complete' for row in written)
-            assert all(row['is_success'] == 'True' for row in written)
-            # 模拟后续批次重试新增字段。
-            batch['csv'][0]['retry_count'] = 1
+    def commit(self, rows):
+        commits.append(len(rows))
+        return original(self, rows)
 
-    calls = install_fake_evaluation(monkeypatch, before)
+    monkeypatch.setattr(checkpoint.CheckpointWriter, 'commit', commit)
+    calls = install_fake_evaluation(monkeypatch)
     cases = dataset(count)
     pipeline._evaluate({'Diagnosis': [cases]})
     written = read_rows(path)
-    assert list(map(len, calls)) == expected
+    assert commits == expected
+    assert list(map(len, calls)) == [1] * count
     assert [row['query'] for row in written] == [f'q{i}' for i in range(count)]
+    assert all(row['structured_reason'] == 'structured complete' for row in written)
+    assert all(row['judge_model2_reason'] == 'review complete' for row in written)
+    assert all(row['is_success'] == 'True' for row in written)
     assert len(cases['csv']) == count
-    if len(expected) > 1:
-        assert written[0]['retry_count'] == ''
-        assert written[expected[0]]['retry_count'] == '1'
 
 
 def test_multiturn_groups_not_split_and_mixed_schema_kept(tmp_path, monkeypatch):
@@ -252,7 +188,7 @@ def test_multiturn_groups_not_split_and_mixed_schema_kept(tmp_path, monkeypatch)
     calls = install_fake_evaluation(monkeypatch)
     pipeline._evaluate({'Diagnosis': [cases]})
     written = read_rows(tmp_path / 'diagnosis' / 'result_outputs_demo.csv')
-    assert list(map(len, calls)) == [10, 3]
+    assert list(map(len, calls)) == [1] * 11 + [2]
     assert len(written) == 12
     assert 'query' not in written[0]
     assert [row['query(t1)'] for row in written[:11]] == [f'q{i}' for i in range(11)]
@@ -266,17 +202,17 @@ def test_evaluation_interruption_keeps_completed_batch(tmp_path, monkeypatch, er
     pipeline = make_pipeline(tmp_path, monkeypatch, 10)
 
     def before(index, batch):
-        if index == 1:
+        if index == 13:
             raise error_type('interrupted')
 
     install_fake_evaluation(monkeypatch, before)
     with pytest.raises(error_type, match='interrupted'):
         pipeline._evaluate({'Diagnosis': [dataset(25)]})
-    assert len(read_rows(tmp_path / 'diagnosis' / 'result_outputs_demo.csv')) == 10
+    assert len(read_rows(tmp_path / 'diagnosis' / 'result_outputs_demo.csv')) == 13
     assert not any(t.name == 'AsyncResultWriter' for t in threading.enumerate())
 
 
-def test_disk_failure_stops_before_next_evaluation(tmp_path, monkeypatch):
+def test_disk_failure_propagates_and_stops_writer(tmp_path, monkeypatch):
     pipeline = make_pipeline(tmp_path, monkeypatch, 10)
     calls = install_fake_evaluation(monkeypatch)
 
@@ -286,7 +222,7 @@ def test_disk_failure_stops_before_next_evaluation(tmp_path, monkeypatch):
     monkeypatch.setattr(CsvWriter, 'append_rows', fail_append)
     with pytest.raises(RuntimeError, match='disk full'):
         pipeline._evaluate({'Diagnosis': [dataset(25)]})
-    assert list(map(len, calls)) == [10, 10]
+    assert 20 <= len(calls) <= 25
     assert len(read_rows(tmp_path / 'diagnosis' / 'result_outputs_demo.csv')) == 10
     assert not any(t.name == 'AsyncResultWriter' for t in threading.enumerate())
 

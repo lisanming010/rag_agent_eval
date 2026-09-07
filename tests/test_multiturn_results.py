@@ -118,9 +118,15 @@ def test_pipeline_preserves_turns_and_reports_parent_result(
             # 确保整体聚合使用复核后的最终指标状态，而非初评状态。
             batch['csv'][-1]['judge_is_success'] = review_override
 
-    monkeypatch.setattr(evaluation_main, 'run_evaluate', lambda batch: None)
-    monkeypatch.setattr(evaluation_main, 'run_evaluate_structured', lambda batch: None)
-    monkeypatch.setattr(evaluation_main, 'run_multimodel_reevaluate', review)
+    async def fake_groups(groups, metrics, on_result, **kwargs):
+        from evaluator.runner import recompute_overall_success
+        for group in groups:
+            batch = {'csv': group}
+            review(batch)
+            recompute_overall_success(batch)
+            await on_result(group)
+
+    monkeypatch.setattr(evaluation_main, 'evaluate_groups', fake_groups)
     case = {'csv': rows, 'case_name': 'test_cases_multiturn.csv', 'metrics': ['judge']}
 
     pipeline._evaluate({'Diagnosis': [case]})

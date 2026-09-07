@@ -1,5 +1,6 @@
 import requests
 import json
+import re
 import os
 import time
 import uuid
@@ -119,7 +120,7 @@ class Diagnosis:
                    session_id: str = None, res_mode: str = DEFAULT_RESPONSE_MODE,
                    language: str = DEFAULT_LANGUAGE, **kwargs):
         """
-        调用诊断智能体
+        调用诊断智能体；suggest 中型号唯一全匹配时，在同一会话追加一次选择请求。
 
         :param question: 诊断问题，如 "故障码1616"
         :param user: 调用方用户标识
@@ -144,6 +145,57 @@ class Diagnosis:
         if session_id is None:
             session_id = str(uuid.uuid4())
 
+        first_raw, first_summary = self._request_once(
+            question, user, session_id, res_mode, language,
+        )
+        if not re.search(r'<suggest\b', first_summary, re.IGNORECASE):
+            return first_raw, first_summary
+
+        logger.debug('诊断候选响应 session_id=%s: %s', session_id, first_raw)
+        selected, reason = self._select_suggestion(question, first_summary)
+        if selected is None:
+            logger.info('诊断未自动选择 session_id=%s: %s', session_id, reason)
+            return first_raw, first_summary
+
+        logger.info('诊断自动选择 session_id=%s, %s, suggest=%s', session_id, reason, selected)
+        # 直接执行单次请求，不递归进入候选选择，保证每次调用最多请求两轮。
+        return self._request_once(selected, user, session_id, res_mode, language)
+
+    @staticmethod
+    def _select_suggestion(question: str, summary: str):
+        """按完整型号值选择唯一候选；字段名兼容中英文，型号值严格区分大小写。"""
+        models = re.findall(
+            r'(?:\bmodel\s*[:：]|型号\s*(?:是|[:：]))\s*([^,，;；\r\n]*)',
+            question, re.IGNORECASE,
+        )
+        if len(models) != 1 or not models[0].strip():
+            return None, 'query 缺少唯一有效型号'
+        model = models[0].strip()
+
+        suggestions = re.findall(r'<suggest\s*>(.*?)</suggest\s*>', summary, re.IGNORECASE | re.DOTALL)
+        opening_count = len(re.findall(r'<suggest\b', summary, re.IGNORECASE))
+        if not suggestions or len(suggestions) != opening_count:
+            return None, 'suggest 标签不完整或格式不支持'
+
+        matches = []
+        for suggestion in suggestions:
+            candidate_models = re.findall(
+                r'(?:\bModel|型号)\s*(?:\(([^()（）]*)\)|（([^()（）]*)）)',
+                suggestion, re.IGNORECASE,
+            )
+            if len(candidate_models) != 1:
+                return None, '候选缺少唯一可解析型号'
+            candidate_model = ''.join(candidate_models[0]).strip()
+            if candidate_model == model:
+                matches.append(suggestion.strip())
+
+        if len(matches) != 1:
+            return None, f'model={model!r}, 全匹配候选数={len(matches)}'
+        return matches[0], f'model={model!r}'
+
+    def _request_once(self, question: str, user: str, session_id: str,
+                      res_mode: str, language: str):
+        """执行一轮诊断请求，返回原始响应和已拼接完成的正文。"""
         data = {
             "inputs": {},
             "query": question,

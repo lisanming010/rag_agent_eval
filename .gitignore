@@ -19,4 +19,5 @@ log/*
 !log/.gitkeep
 __pycache__/main.cpython-312.pyc
 /data_qa
+/dataqa_test/
 数据流与隔离设计.md

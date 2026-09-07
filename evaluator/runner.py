@@ -1,458 +1,256 @@
-"""评测执行器，封装 deepeval evaluate 调用 + 重试 + 结果回写"""
+"""逐例异步评价：直接调用 metric.a_measure，不使用 DeepEval evaluate 的全量屏障。"""
 
-import time
-
-from deepeval import evaluate
-from deepeval.evaluate.configs import AsyncConfig, ErrorConfig
+import asyncio
+import copy
+import inspect
+import math
+from collections import Counter
 
 from tool.config_reader import ConfigReader
-from tool.log_factory import LogFactory
 from evaluator.metrics import (
-    reverse_validation_metric,
-    contextual_recall_metric,
-    mrr_metric,
-    recallk_metric,
-    precisionk_metric,
-    dataqa_capability_metric,
-    dataqa_params_metric,
-    create_metrics_for_model,
+    reverse_validation_metric, contextual_recall_metric, mrr_metric,
+    recallk_metric, precisionk_metric, dataqa_capability_metric,
+    dataqa_params_metric, create_metrics_for_model,
 )
 
-logger = LogFactory.get_logger(__name__)
-
-_conf = ConfigReader.get_instance()
-METRIC_NEEDS_REVIEW: set[str] = set(_conf.get('metric_conf.needs_review', []))
-
-#指标注册表
 METRICS_MAP = {
     'reverse_validation': reverse_validation_metric,
     'contextual_recall': contextual_recall_metric,
-    'mrr': mrr_metric,
-    'recallk': recallk_metric,
-    'precisionk': precisionk_metric,
-    'dataqa_capability': dataqa_capability_metric,
-    'dataqa_params': dataqa_params_metric,
+    'mrr': mrr_metric, 'recallk': recallk_metric, 'precisionk': precisionk_metric,
+    'dataqa_capability': dataqa_capability_metric, 'dataqa_params': dataqa_params_metric,
 }
-
-
-def _resolve_metrics(metrics_str: list[str]) -> list:
-    """将指标名称列表解析为 deepeval metric 实例列表"""
-    metrics = []
-    for metric_name in metrics_str:
-        eva_metric = METRICS_MAP.get(metric_name, None)
-        if eva_metric is None:
-            logger.error(f'{metric_name}尚未注册，请在evaluator/metrics.py中实现后在METRICS_MAP中完成注册')
-            raise ValueError(
-                f'{metric_name}尚未注册，请在evaluator/metrics.py中实现后在METRICS_MAP中完成注册'
-            )
-        metrics.append(eva_metric)
-    return metrics
-
-
-# 检索类指标名称 — 需路由到 llm_test_case_retrieval 的指标
 RETRIEVAL_METRICS = {'mrr', 'recallk', 'precisionk'}
-
-
-def _batch_evaluate(cases: list[dict], tc_key: str, metrics: list,
-                    track_label: str):
-    """单轨评测：evaluate → 重试 → 回写 per-metric 字段
-
-    :param cases: 用例 dict 列表（原地修改）
-    :param tc_key: LLMTestCase 在 case dict 中的 key，如 'llm_test_case' 或 'llm_test_case_retrieval'
-    :param metrics: deepeval metric 实例列表
-    :param track_label: 日志标签，如 '文本质量'、'检索'
-    """
-    if not metrics:
-        return
-
-    conf_reader = ConfigReader.get_instance()
-
-    valid_cases = [c for c in cases if tc_key in c]
-    skipped = [c for c in cases if tc_key not in c]
-
-    for case in skipped:
-        if 'is_success' not in case:
-            case['is_success'] = False
-        if 'evaluate_error' not in case:
-            case['evaluate_error'] = f'{tc_key}缺失，无法执行{track_label}评测'
-
-    if skipped:
-        logger.info(f"[{track_label}] 跳过 {len(skipped)} 条缺少 {tc_key} 的用例")
-
-    if not valid_cases:
-        logger.warning(f"[{track_label}] 无有效用例，跳过评测")
-        return
-
-    llm_cases = [c[tc_key] for c in valid_cases]
-
-    eval_max_retries = conf_reader.get('retry.eval_max_retries', 2)
-    retry_backoff_base = conf_reader.get('retry.backoff_base', 2)
-    retry_max_backoff = conf_reader.get('retry.max_backoff', 60)
-    retry_verbose = conf_reader.get('retry.verbose', True)
-
-    eva_run_async = conf_reader.get('evluate.run_async')
-    eva_max_concurrent = conf_reader.get('evluate.max_concurrent')
-    eva_throttle_value = conf_reader.get('evluate.throttle_value')
-
-    # 首次全量 evaluate
-    result = evaluate(
-        llm_cases,
-        metrics,
-        async_config=AsyncConfig(
-            run_async=eva_run_async,
-            max_concurrent=eva_max_concurrent,
-            throttle_value=eva_throttle_value
-        ),
-        error_config=ErrorConfig(ignore_errors=True)
-    )
-
-    result_map = {tr.input: tr for tr in result.test_results}
-
-    def _score_missing(tr):
-        if not tr.metrics_data:
-            return True
-        return any(md.score is None for md in tr.metrics_data)
-
-    pending = [
-        case for case in valid_cases
-        if case['query'] not in result_map
-        or _score_missing(result_map[case['query']])
-    ]
-
-    # 重试循环
-    initial_pending = len(pending)
-    retry_round = 0
-    while pending and retry_round < eval_max_retries:
-        retry_round += 1
-        delay = min(retry_backoff_base ** retry_round, retry_max_backoff)
-
-        completed = initial_pending - len(pending)
-        if retry_verbose:
-            logger.info(f"[{track_label} 重试] 第 {retry_round}/{eval_max_retries} 轮，"
-                        f"已完成 {completed}/{initial_pending}，"
-                        f"待重试 {len(pending)} 条，等待 {delay:.1f}s")
-
-        time.sleep(delay)
-
-        still_pending = []
-        for idx, case in enumerate(pending):
-            query = case['query']
-            try:
-                retry_result = evaluate(
-                    [case[tc_key]],
-                    metrics,
-                    error_config=ErrorConfig(ignore_errors=False)
-                )
-                if retry_result.test_results:
-                    result_map[query] = retry_result.test_results[0]
-                    case['retry_count'] = retry_round
-                    if retry_verbose:
-                        logger.info(f"  ✓ [{completed + idx + 1}/{initial_pending}] "
-                                    f"query='{query[:50]}' 第{retry_round}轮重试成功")
-                    continue
-            except Exception as e:
-                if retry_verbose:
-                    logger.info(f"  ✗ [{completed + idx + 1}/{initial_pending}] "
-                                f"query='{query[:50]}' 重试异常: {e}")
-
-            still_pending.append(case)
-
-        pending = still_pending
-
-    # 最终失败标记
-    for case in pending:
-        case['is_success'] = False
-        case['evaluate_error'] = f"[{track_label}] 经过{eval_max_retries}轮重试后仍无评测结果"
-        case['retry_count'] = eval_max_retries
-        if retry_verbose:
-            logger.error(f"[{track_label} 失败] query='{case['query'][:60]}' "
-                         f"经{eval_max_retries}轮重试仍失败")
-
-    # 结果回写（仅 per-metric 字段，is_success 由 recompute_overall_success 统一计算）
-    for case_dict in cases:
-        query = case_dict['query']
-        test_result = result_map.get(query)
-        if test_result is None:
-            continue
-
-        for md in test_result.metrics_data:
-            metrics_name = md.name
-            case_dict[f'{metrics_name}_is_success'] = md.success
-            case_dict[f'{metrics_name}_score'] = md.score
-            case_dict[f'{metrics_name}_threshold'] = md.threshold
-            case_dict[f'{metrics_name}_reason'] = md.reason
-
-
-def run_evaluate(test_case: dict):
-    """双轨评测：按 metric 类型分流到文本轨 / 检索轨
-
-    文本轨 → llm_test_case → reverse_validation, contextual_recall 等
-    检索轨 → llm_test_case_retrieval → mrr, recallk, precisionk
-    """
-    test_case_csv = test_case['csv']
-    configured = test_case['metrics']
-
-    text_metrics = [m for m in configured if m not in RETRIEVAL_METRICS]
-    retrieval_metrics = [m for m in configured if m in RETRIEVAL_METRICS]
-
-    if text_metrics:
-        _batch_evaluate(
-            test_case_csv, 'llm_test_case',
-            _resolve_metrics(text_metrics), '文本质量'
-        )
-
-    if retrieval_metrics:
-        _batch_evaluate(
-            test_case_csv, 'llm_test_case_retrieval',
-            _resolve_metrics(retrieval_metrics), '检索'
-        )
-
-    # 兜底：完全缺失 LLMTestCase 的用例标记失败
-    for case in test_case_csv:
-        has_text = 'llm_test_case' in case
-        has_retrieval = 'llm_test_case_retrieval' in case
-        if not has_text and not has_retrieval:
-            if 'is_success' not in case:
-                case['is_success'] = False
-                case['用例是否通过'] = False
-            if 'evaluate_error' not in case:
-                case['evaluate_error'] = '所有LLMTestCase均缺失，无法执行评测'
-
-
-def run_multimodel_reevaluate(test_case: dict):
-    """
-    对一轮评测后的 bad_cases 使用 model2 和 model3 批量重新评测（仅 LLM 类指标），
-    结果追加到 case 字典并按三模型投票更新最终 is_success。
-
-    :param test_case: 一轮评测后的测试数据集 {'csv': [dict], 'case_name': str, 'metrics': [str]}
-    """
-    conf = ConfigReader.get_instance()
-    model2_name = conf.get('judge_llm.anthropic.model2')
-    model3_name = conf.get('judge_llm.anthropic.model3')
-
-    if not model2_name or not model3_name:
-        logger.warning("未配置 model2/model3，跳过多模型复核")
-        return
-
-    test_case_csv = test_case['csv']
-    all_metrics = test_case['metrics']
-
-    # 筛选出需要多模型复核的指标（由 config 中 metric_conf.needs_review 控制）
-    llm_metrics = [m for m in all_metrics if m in METRIC_NEEDS_REVIEW]
-    logger.debug(f'需复核的数据集：\n{llm_metrics}\n')
-    if not llm_metrics:
-        return
-
-    # 筛选 bad_cases
-    bad_cases = [
-        case for case in test_case_csv
-        if 'llm_test_case' in case and case.get('is_success') is not True
-    ]
-    if not bad_cases:
-        logger.info(f"[多模型复核] 无 bad_case，跳过")
-        return
-
-    logger.info(f"[多模型复核] 发现 {len(bad_cases)} 条 bad_case，启动 model2/model3 批量复核")
-
-    # 为 model2/model3 创建 LLM 指标实例
-    model2_metrics = create_metrics_for_model(model2_name, llm_metrics)
-    model3_metrics = create_metrics_for_model(model3_name, llm_metrics)
-
-    eva_run_async = conf.get('evluate.run_async')
-    eva_max_concurrent = conf.get('evluate.max_concurrent')
-    eva_throttle_value = conf.get('evluate.throttle_value')
-
-    # 批量评测：model2 和 model3 各一次 evaluate 调用，内部并发
-    _batch_reevaluate(bad_cases, model2_metrics, 'model2',
-                      eva_run_async, eva_max_concurrent, eva_throttle_value)
-    _batch_reevaluate(bad_cases, model3_metrics, 'model3',
-                      eva_run_async, eva_max_concurrent, eva_throttle_value)
-
-    # 按计划复核的指标投票，调用失败或无返回结果也必须计入失败票。
-    reviewed_metric_names = [metric.__name__ for metric in model2_metrics.values()]
-    for case in bad_cases:
-        _apply_voting(case, reviewed_metric_names)
-
-
-def _batch_reevaluate(bad_cases: list[dict], metrics_map: dict, model_label: str,
-                      run_async: bool, max_concurrent: int, throttle_value: int):
-    """对一批 bad_cases 批量执行评测，内置重试，结果按 query 回写到各自 case 字典"""
-    metric_instances = list(metrics_map.values())
-    if not metric_instances:
-        return
-
-    conf = ConfigReader.get_instance()
-    eval_max_retries = conf.get('retry.eval_max_retries', 2)
-    retry_backoff_base = conf.get('retry.backoff_base', 2)
-    retry_max_backoff = conf.get('retry.max_backoff', 60)
-
-    def _do_evaluate(cases: list[dict], ignore_errors: bool):
-        logger.info(f'执行复核，复核模型：{model_label}')
-        return evaluate(
-            [c['llm_test_case'] for c in cases],
-            metric_instances,
-            async_config=AsyncConfig(
-                run_async=run_async,
-                max_concurrent=max_concurrent,
-                throttle_value=throttle_value
-            ),
-            error_config=ErrorConfig(ignore_errors=ignore_errors)
-        )
-
-    def _score_missing(tr):
-        if not tr.metrics_data:
-            return True
-        return any(md.score is None for md in tr.metrics_data)
-
-    # 首次批量评测
-    try:
-        result = _do_evaluate(bad_cases, ignore_errors=True)
-    except Exception as e:
-        logger.error(f"[多模型复核] {model_label} 批量评测异常: {e}")
-        return
-
-    result_map = {tr.input: tr for tr in result.test_results}
-
-    # 筛选 score 缺失的用例（JSON 解析失败等）
-    pending = [
-        case for case in bad_cases
-        if case['query'] not in result_map
-        or _score_missing(result_map[case['query']])
-    ]
-
-    # 重试循环
-    initial_pending = len(pending)
-    retry_round = 0
-    while pending and retry_round < eval_max_retries:
-        retry_round += 1
-        delay = min(retry_backoff_base ** retry_round, retry_max_backoff)
-        completed = initial_pending - len(pending)
-        logger.info(f"[多模型复核] {model_label} 第 {retry_round}/{eval_max_retries} 轮重试，"
-                    f"已完成 {completed}/{initial_pending}，"
-                    f"待重试 {len(pending)} 条，等待 {delay:.1f}s")
-        time.sleep(delay)
-
-        still_pending = []
-        for idx, case in enumerate(pending):
-            try:
-                retry_result = _do_evaluate([case], ignore_errors=False)
-                if retry_result.test_results and not _score_missing(retry_result.test_results[0]):
-                    result_map[case['query']] = retry_result.test_results[0]
-                    logger.info(f"  ✓ [{completed + idx + 1}/{initial_pending}] "
-                                f"query='{case['query'][:50]}' {model_label}重试成功")
-                    continue
-            except Exception as e:
-                logger.info(f"  ✗ [{completed + idx + 1}/{initial_pending}] "
-                            f"query='{case['query'][:50]}' {model_label}重试异常: {e}")
-            still_pending.append(case)
-
-        pending = still_pending
-
-    if pending:
-        logger.warning(f"[多模型复核] {model_label} {len(pending)} 条经{eval_max_retries}轮重试仍无结果")
-
-    # 结果回写（按 query 索引，异步模式下顺序可能不一致）
-    for case in bad_cases:
-        tr = result_map.get(case['query'])
-        if tr is None:
-            continue
-        for md in tr.metrics_data:
-            case[f'{md.name}_{model_label}_score'] = md.score
-            case[f'{md.name}_{model_label}_is_success'] = md.success
-            case[f'{md.name}_{model_label}_reason'] = md.reason
-            case[f'{md.name}_{model_label}_threshold'] = md.threshold
-
-
-def _apply_voting(case: dict, metric_names: list[str]):
-    """
-    基于三模型投票更新 case 的最终 is_success：
-    对每个计划复核的指标，仅布尔 True 算通过，三模型中至少两个通过才最终通过。
-    缺失、None 和其他非 True 值均计为失败票。
-    整体 is_success = 所有指标的最终结果取 AND。
-    """
-    for metric_prefix in metric_names:
-        m1 = case.get(f'{metric_prefix}_is_success')
-        m2 = case.get(f'{metric_prefix}_model2_is_success')
-        m3 = case.get(f'{metric_prefix}_model3_is_success')
-
-        pass_count = sum(1 for v in (m1, m2, m3) if v is True)
-        case[f'{metric_prefix}_is_success'] = pass_count >= 2
-
-    # 重新计算整体 is_success：所有指标 _is_success 取 AND
-    all_success = True
-    for key, val in case.items():
-        if key.endswith('_is_success') and key != 'is_success' and '_model' not in key:
-            if val is not True:
-                all_success = False
-                break
-    case['is_success'] = all_success
-    # 反向归一化：is_success → 用例是否通过
-    case['用例是否通过'] = all_success
-
-
-def run_evaluate_structured(test_case: dict):
-    """执行 DataQA 结构化断言（capability_id + parameters）。
-
-    仅写入 per-metric 字段，不修改 is_success。
-    """
-    configured = test_case['metrics']
-
-    if 'dataqa_capability' in configured:
-        _eval_single_structured_metric(
-            test_case['csv'], dataqa_capability_metric, 'llm_test_case_capability'
-        )
-
-    if 'dataqa_params' in configured:
-        _eval_single_structured_metric(
-            test_case['csv'], dataqa_params_metric, 'llm_test_case_params'
-        )
-
-
-def _eval_single_structured_metric(csv_rows: list[dict], metric, tc_key: str):
-    """对单个结构化 metric 执行 evaluate 并回写 per-metric 字段。"""
-    valid_cases = [c for c in csv_rows if tc_key in c]
-    if not valid_cases:
-        logger.debug(f"[结构化] {metric.__name__}: 无有效用例（缺少 {tc_key}），跳过")
-        return
-
-    try:
-        result = evaluate(
-            [c[tc_key] for c in valid_cases],
-            [metric],
-            error_config=ErrorConfig(ignore_errors=True),
-        )
-    except Exception as e:
-        logger.error(f"[结构化] {metric.__name__} evaluate 异常: {e}")
-        return
-
-    result_map = {tr.input: tr for tr in result.test_results}
-
-    for case in csv_rows:
-        tr = result_map.get(case['query'])
-        if tr is None:
-            continue
-        for md in tr.metrics_data:
-            case[f'{md.name}_score'] = md.score
-            case[f'{md.name}_is_success'] = md.success
-            case[f'{md.name}_reason'] = md.reason
-            case[f'{md.name}_threshold'] = md.threshold
-
-    ok = sum(1 for c in valid_cases
-             if result_map.get(c['query']) and result_map[c['query']].success)
-    logger.info(f"[结构化] {metric.__name__}: {ok}/{len(valid_cases)} 通过")
+STRUCTURED_KEYS = {'dataqa_capability': 'llm_test_case_capability',
+                   'dataqa_params': 'llm_test_case_params'}
 
 
 def recompute_overall_success(test_case: dict):
-    """所有 *_is_success 字段（排除 _model）均为布尔 True 才通过。"""
+    """所有指标均为布尔 True 才通过；没有指标结果不能通过。"""
     for case in test_case['csv']:
-        metric_keys = [
-            k for k in case
-            if k.endswith('_is_success')
-            and k != 'is_success'
-            and '_model' not in k
-        ]
-        if not metric_keys:
-            continue
-        all_pass = all(case[k] is True for k in metric_keys)
-        case['is_success'] = all_pass
-        case['用例是否通过'] = all_pass
+        keys = [k for k in case if k.endswith('_is_success') and '_model' not in k]
+        success = bool(keys) and all(case[k] is True for k in keys)
+        case['is_success'] = case['用例是否通过'] = success
+
+
+def _apply_voting(case: dict, metric_names: list[str]):
+    for name in metric_names:
+        votes = [case.get(f'{name}{suffix}_is_success')
+                 for suffix in ('', '_model2', '_model3')]
+        case[f'{name}_is_success'] = sum(v is True for v in votes) >= 2
+    recompute_overall_success({'csv': [case]})
+
+
+def _fresh_metric(template):
+    # 保留原生模型类型和客户端；GEval 的原生 logprobs 路径不变。
+    # 其余可变状态完全隔离，模板本身从不执行 measure。
+    model = getattr(template, 'model', None)
+    metric = copy.deepcopy(template, {id(model): model} if model is not None else {})
+    for attr in ('score', 'reason', 'success', 'error'):
+        setattr(metric, attr, None)
+    return metric
+
+
+class CaseEvaluator:
+    """一个数据集共用一个调用配额；每次指标尝试使用独立 metric。"""
+
+    def __init__(self, metrics, conf=None, check_health=lambda: None):
+        conf = conf or ConfigReader.get_instance()
+        self.metrics = list(dict.fromkeys(metrics))
+        for name in self.metrics:
+            if name not in METRICS_MAP:
+                raise ValueError(f'未注册评价指标: {name}')
+        self.concurrency = conf.get('evluate.max_concurrent', 10)
+        if type(self.concurrency) is not int or self.concurrency < 1:
+            raise ValueError('evluate.max_concurrent 必须为正整数')
+        if not conf.get('evluate.run_async', True):
+            self.concurrency = 1
+        self.inflight = self.concurrency * 2
+        self.throttle = conf.get('evluate.throttle_value', 0)
+        self.timeout = conf.get('evluate.metric_timeout', 180)
+        self.retries = conf.get('retry.eval_max_retries', 2)
+        self.backoff = conf.get('retry.backoff_base', 2)
+        self.max_backoff = conf.get('retry.max_backoff', 60)
+        if type(self.retries) is not int or self.retries < 0:
+            raise ValueError('retry.eval_max_retries 必须为非负整数')
+        for key, value, minimum in [('throttle_value', self.throttle, 0),
+                                    ('metric_timeout', self.timeout, 0.001),
+                                    ('backoff_base', self.backoff, 0),
+                                    ('max_backoff', self.max_backoff, 0)]:
+            if type(value) not in (int, float) or not math.isfinite(value) or value < minimum:
+                raise ValueError(f'{key} 配置无效')
+        self.review_names = [n for n in self.metrics
+                             if n in conf.get('metric_conf.needs_review', [])]
+        self.review_models = [conf.get(f'judge_llm.anthropic.model{i}') for i in (2, 3)]
+        self.templates = {None: {n: METRICS_MAP[n] for n in self.metrics}}
+        self.gate = asyncio.Semaphore(self.concurrency)
+        self.start_lock = asyncio.Lock()
+        self.next_start = 0
+        self.check_health = check_health
+        self.active = Counter()
+        self.retry_waiting = 0
+
+    async def _measure(self, template, test_case, label):
+        async with self.gate:
+            # 所有轨道、复核和重试使用同一个节流时钟。
+            async with self.start_lock:
+                self.check_health()
+                loop = asyncio.get_running_loop()
+                await asyncio.sleep(max(0, self.next_start - loop.time()))
+                self.check_health()
+                self.next_start = loop.time() + self.throttle
+            metric = _fresh_metric(template)
+            parameters = inspect.signature(metric.a_measure).parameters
+            kwargs = {key: False for key in ('_show_indicator', '_log_metric_to_confident')
+                      if key in parameters}
+            self.active[label] += 1
+            try:
+                await asyncio.wait_for(metric.a_measure(test_case, **kwargs), self.timeout)
+                score = metric.score
+                if (type(score) not in (int, float) or not math.isfinite(score)
+                        or getattr(metric, 'error', None)):
+                    raise ValueError(getattr(metric, 'error', None) or '指标未返回有效 score')
+                return {'score': score, 'is_success': metric.is_successful() is True,
+                        'threshold': metric.threshold, 'reason': metric.reason}
+            finally:
+                self.active[label] -= 1
+
+    async def _metric(self, case, name, template, key, label='primary'):
+        prefix = template.__name__ + ('' if label == 'primary' else f'_{label}')
+        result = {'score': None, 'is_success': False,
+                  'threshold': template.threshold, 'reason': ''}
+        error = None
+        if key not in case:
+            error = f'{key} 缺失，无法评价 {name}'
+        else:
+            for attempt in range(self.retries + 1):
+                self.check_health()
+                if attempt:
+                    self.retry_waiting += 1
+                    try:
+                        await asyncio.sleep(min(self.backoff ** attempt, self.max_backoff))
+                    finally:
+                        self.retry_waiting -= 1
+                    self.check_health()
+                try:
+                    result = await self._measure(template, case[key], label)
+                    error = None
+                    break
+                except Exception as exc:
+                    # CancelledError/BaseException 不转成评分失败，不重试取消的调用。
+                    self.check_health()
+                    error = f'{type(exc).__name__}: {exc}'
+                finally:
+                    if attempt:
+                        case['retry_count'] = max(case.get('retry_count', 0), attempt)
+        if error is not None:
+            result['reason'] = error
+            message = f'[{label}/{name}] {error}'
+            previous = case.get('evaluate_error', '')
+            case['evaluate_error'] = f'{previous}; {message}' if previous else message
+        case.update({f'{prefix}_{field}': value for field, value in result.items()})
+
+    async def evaluate_case(self, case):
+        case['is_success'] = False
+        for name in self.metrics:
+            key = STRUCTURED_KEYS.get(name, 'llm_test_case_retrieval'
+                                      if name in RETRIEVAL_METRICS else 'llm_test_case')
+            await self._metric(case, name, self.templates[None][name], key)
+        recompute_overall_success({'csv': [case]})
+        if (case['is_success'] or not self.review_names or not all(self.review_models)
+                or 'llm_test_case' not in case):
+            return
+        reviewed = []
+        for index, model in enumerate(self.review_models, 2):
+            self.check_health()
+            if model not in self.templates:
+                self.templates[model] = create_metrics_for_model(model, self.review_names)
+            templates = self.templates[model]
+            for name, template in templates.items():
+                if index == 2:
+                    reviewed.append(template.__name__)
+                await self._metric(case, name, template, 'llm_test_case', f'model{index}')
+        _apply_voting(case, reviewed)
+
+    async def evaluate_group(self, rows):
+        # 父用例作为终态单位；子轮依次处理，避免轮数放大在途任务数。
+        for row in rows:
+            await self.evaluate_case(row)
+        return rows
+
+
+async def evaluate_groups(groups, metrics, on_result, *, conf=None,
+                          check_health=lambda: None, write_stats=lambda: {}, label='评价'):
+    """有界调度，按完成顺序交付完整父用例。on_result 是唯一结果出口。"""
+    evaluator = CaseEvaluator(metrics, conf, check_health)
+    completed = asyncio.Queue()
+    pending = set()
+    delivered = set()
+    iterator = iter(groups)
+    finished = 0
+    started = 0
+
+    def replenish():
+        nonlocal started
+        while len(pending) < evaluator.inflight:
+            check_health()
+            rows = next(iterator, None)
+            if rows is None:
+                break
+            task = asyncio.create_task(evaluator.evaluate_group(rows))
+            pending.add(task)
+            task.add_done_callback(completed.put_nowait)
+            started += 1
+
+    async def deliver(task):
+        nonlocal finished
+        rows = task.result()
+        # 回调在首次 await 之前接收 rows；取消时由调用方排空已接收的缓冲。
+        delivered.add(task)
+        await on_result(rows)
+        finished += 1
+
+    async def monitor():
+        last_log = 0
+        while True:
+            check_health()
+            now = asyncio.get_running_loop().time()
+            if now - last_log >= 1:
+                stats = write_stats()
+                print(f'[{label}] 终态 {finished}/{len(groups)} | 待启动 {len(groups)-started}'
+                      f' | 主评 {evaluator.active["primary"]}'
+                      f' | 复核 {evaluator.active["model2"] + evaluator.active["model3"]}'
+                      f' | 重试等待 {evaluator.retry_waiting}'
+                      f' | 已提交 {stats.get("committed_rows", 0)}'
+                      f' | 写入队列 {stats.get("pending", 0)}', flush=True)
+                last_log = now
+            await asyncio.sleep(0.05)
+
+    async def consume():
+        replenish()
+        while pending:
+            task = await completed.get()
+            await deliver(task)
+            pending.remove(task)
+            delivered.discard(task)
+            replenish()
+
+    consumer = asyncio.create_task(consume())
+    watcher = asyncio.create_task(monitor())
+    try:
+        done, _ = await asyncio.wait((consumer, watcher), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            task.result()
+    finally:
+        consumer.cancel()
+        watcher.cancel()
+        await asyncio.gather(consumer, watcher, return_exceptions=True)
+        for task in pending:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        # 中断时保存已完成但尚未交付的终态；半成品父用例绝不落盘。
+        check_health()
+        while not completed.empty():
+            task = completed.get_nowait()
+            if task not in delivered and not task.cancelled() and task.exception() is None:
+                await deliver(task)

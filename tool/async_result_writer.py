@@ -1,9 +1,10 @@
+import asyncio
 import os
 import queue
 import threading
 from pathlib import Path
 
-from tool.result_checkpoint import CheckpointWriter
+from tool.result_checkpoint import CheckpointWriter, csv_value
 
 
 class AsyncResultWriter:
@@ -15,16 +16,17 @@ class AsyncResultWriter:
     - 写入线程(消费者):从队列中取出结果并写入文件
 
     :params: base_path: 结果文件保存的基础路径
-    :params: max_queue_size: 队列最大容量,默认 0(无限制)
+    :params: max_queue_size: 等待写入的批次数，默认 2
     """
 
-    def __init__(self, base_path: str, max_queue_size: int = 0):
+    def __init__(self, base_path: str, max_queue_size: int = 2):
         self.base_path = Path(base_path)
         self.result_queue = queue.Queue(maxsize=max_queue_size)
         self.writer_thread = None
         self.stop_signal = threading.Event()
         self.error_count = 0
         self.success_count = 0
+        self.committed_rows = 0
         self._lock = threading.Lock()
         self._write_error = None
         self._checkpoint_writers = {}
@@ -73,6 +75,7 @@ class AsyncResultWriter:
 
                 with self._lock:
                     self.success_count += 1
+                    self.committed_rows += len(rows)
                 print(f"结果与 checkpoint 已提交: {result_output}（本批 {len(rows)} 条）", flush=True)
             except Exception as e:
                 with self._lock:
@@ -95,9 +98,36 @@ class AsyncResultWriter:
             raise RuntimeError("写入线程未启动,请先调用 start()")
 
         self._raise_if_failed()
-        # 固定本批字段值，避免调用方后续回写同一行影响队列中的结果。
-        rows = [dict(row) for row in test_case['csv']]
-        self.result_queue.put((rows, case_name, append))
+        rows = self._snapshot(test_case)
+        while True:
+            self.check_health()
+            try:
+                self.result_queue.put((rows, case_name, append), timeout=0.05)
+                return
+            except queue.Full:
+                pass
+
+    @staticmethod
+    def _snapshot(test_case):
+        # 在提交端固定嵌套值的最终 CSV 字符串，后续修改不能改变待写入结果。
+        return [{key: csv_value(value) for key, value in row.items()}
+                for row in test_case['csv']]
+
+    def check_health(self):
+        self._raise_if_failed()
+        if self.writer_thread is None or not self.writer_thread.is_alive():
+            raise RuntimeError('写入线程未运行')
+
+    async def submit_async(self, test_case: dict, case_name: str, *, append=False):
+        """队列满时异步背压，不阻塞事件循环；成功入队与返回之间不 await。"""
+        rows = self._snapshot(test_case)
+        while True:
+            self.check_health()
+            try:
+                self.result_queue.put_nowait((rows, case_name, append))
+                return
+            except queue.Full:
+                await asyncio.sleep(0.05)
 
     def _raise_if_failed(self):
         with self._lock:
@@ -132,6 +162,7 @@ class AsyncResultWriter:
         with self._lock:
             return {
                 "success": self.success_count,
+                "committed_rows": self.committed_rows,
                 "error": self.error_count,
                 "pending": self.result_queue.qsize()
             }
